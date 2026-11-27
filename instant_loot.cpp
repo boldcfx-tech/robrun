@@ -37,7 +37,6 @@ static const wchar_t* DEFAULT_KEYWORD = L"ROB RUN";
 static const wchar_t* GAME_ASSEMBLY   = L"GameAssembly.dll";
 static const DWORD    WATCH_INTERVAL  = 100;
 
-// verified against robrun_offsets.json / robrun_sdk_offsets.json
 enum : uintptr_t
 {
     OFF_UPD_BEM        = 0x18,
@@ -48,7 +47,7 @@ enum : uintptr_t
     OFF_BATTLE_CAM     = 0x358,
     OFF_BEM_WORLD      = 0x60,
 
-    OFF_WM_WORLD       = 0x38,   // WorldModel.WorldEntitiesModel
+    OFF_WM_WORLD       = 0x38,
 
     OFF_WEM_CHARS      = 0x18,
     OFF_WEM_CONTAINERS = 0x20,
@@ -557,6 +556,9 @@ static uintptr_t g_worldModel = 0;
 static uintptr_t g_updater = 0;
 static DWORD     g_lastStatic = 0;
 static DWORD     g_lastUpdScan = 0;
+static DWORD     g_lastBlind = 0;
+static std::atomic<bool> g_scanning(false);
+static bool      g_dumped = false;
 
 static bool finite(float f) { return f == f && fabsf(f) < 1e7f; }
 
@@ -616,7 +618,7 @@ static bool validWorldModel(uintptr_t wm)
     return validEntitiesModel(w);
 }
 
-// the slot may hold the instance itself, a static-fields block, or an Il2CppClass
+// slot may hold the instance, a static-fields block, or an Il2CppClass
 static uintptr_t staticInstance(uintptr_t rva, bool (*validate)(uintptr_t))
 {
     if (!g_gaBase || !rva) return 0;
@@ -625,14 +627,23 @@ static uintptr_t staticInstance(uintptr_t rva, bool (*validate)(uintptr_t))
 
     if (validate(p)) return p;
 
-    uintptr_t q = 0;
-    if (readPtr(p + 0x10, &q) && validate(q)) return q;
+    // static-fields block: sweep every pointer-sized field for a valid value
+    for (uintptr_t foff = 0x10; foff < 0x200; foff += 8)
+    {
+        uintptr_t q = 0;
+        if (readPtr(p + foff, &q) && validate(q)) return q;
+    }
 
-    for (uintptr_t off = 0x80; off < 0x200; off += 8)
+    // Il2CppClass: find static_fields, then sweep the block
+    for (uintptr_t koff = 0x40; koff < 0x300; koff += 8)
     {
         uintptr_t sf = 0;
-        if (!readPtr(p + off, &sf)) continue;
-        if (readPtr(sf + 0x10, &q) && validate(q)) return q;
+        if (!readPtr(p + koff, &sf)) continue;
+        for (uintptr_t foff = 0x10; foff < 0x100; foff += 8)
+        {
+            uintptr_t q = 0;
+            if (readPtr(sf + foff, &q) && validate(q)) return q;
+        }
     }
     return 0;
 }
@@ -660,22 +671,54 @@ static void refreshStatics()
         printf("[+] GameAssembly base %p size %zx\n", (void*)g_gaBase, g_gaSize);
     }
 
+    if (!g_dumped && g_gaBase)
+    {
+        g_dumped = true;
+        uintptr_t cp = 0, wp = 0;
+        readPtr(g_gaBase + RVA_CAMERA_STATIC, &cp);
+        readPtr(g_gaBase + RVA_WORLD_STATIC, &wp);
+        printf("[.] cam slot -> %p   world slot -> %p\n", (void*)cp, (void*)wp);
+    }
+
     if (!g_camModel || !validCameraModel(g_camModel))
     {
-        g_camModel = staticInstance(RVA_CAMERA_STATIC, validCameraModel);
-        if (g_camModel) printf("[+] camera model %p\n", (void*)g_camModel);
+        uintptr_t found = staticInstance(RVA_CAMERA_STATIC, validCameraModel);
+        if (found && found != g_camModel)
+        {
+            g_camModel = found;
+            printf("[+] camera model %p\n", (void*)g_camModel);
+        }
     }
 
     if (!g_worldModel || !validWorldModel(g_worldModel))
-        g_worldModel = staticInstance(RVA_WORLD_STATIC, validWorldModel);
+    {
+        uintptr_t found = staticInstance(RVA_WORLD_STATIC, validWorldModel);
+        if (found && found != g_worldModel)
+        {
+            g_worldModel = found;
+            printf("[+] world model %p\n", (void*)g_worldModel);
+        }
+    }
 
     if (g_worldModel)
     {
         uintptr_t w = 0;
         if (readPtr(g_worldModel + OFF_WM_WORLD, &w) && validEntitiesModel(w))
         {
-            if (w != g_world) printf("[+] world entities %p (model %p)\n", (void*)w, (void*)g_worldModel);
+            if (w != g_world) printf("[+] world entities %p\n", (void*)w);
             g_world = w;
+        }
+    }
+
+    // camera via the updater chain as well
+    if (!g_camModel && g_updater)
+    {
+        uintptr_t battle = 0, cam = 0;
+        if (readPtr(g_updater + OFF_UPD_BATTLE, &battle) && readPtr(battle + OFF_BATTLE_CAM, &cam) &&
+            validCameraModel(cam))
+        {
+            g_camModel = cam;
+            printf("[+] camera via updater %p\n", (void*)cam);
         }
     }
 
@@ -702,6 +745,124 @@ static void refreshStatics()
         else g_camOk = false;
     }
     else g_camOk = false;
+}
+
+// ------------------------------------------------------------------ blind world scan
+struct Range { uintptr_t lo, hi; };
+static std::vector<Range> g_ranges;
+
+static bool inRanges(uintptr_t v)
+{
+    size_t lo = 0, hi = g_ranges.size();
+    while (lo < hi)
+    {
+        size_t mid = (lo + hi) / 2;
+        if (v < g_ranges[mid].lo) hi = mid;
+        else if (v >= g_ranges[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+static void buildRanges()
+{
+    g_ranges.clear();
+    MEMORY_BASIC_INFORMATION m = { 0 };
+    uintptr_t a = 0x10000;
+    while (queryRegion(a, &m))
+    {
+        if (m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) &&
+            (m.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)))
+        {
+            Range r;
+            r.lo = (uintptr_t)m.BaseAddress;
+            r.hi = r.lo + m.RegionSize;
+            g_ranges.push_back(r);
+        }
+        uintptr_t nx = (uintptr_t)m.BaseAddress + m.RegionSize;
+        if (nx <= a) break;
+        a = nx;
+    }
+}
+
+static bool blindWorldOk(uintptr_t w)
+{
+    uintptr_t d = 0, e = 0;
+    if (!readPtr(w + OFF_WEM_CHARS, &d)) return false;
+    if (!readPtr(d + OFF_DICT_ENTRIES, &e)) return false;
+    int c = read<int>(d + OFF_DICT_COUNT);
+    if (c < 1 || c > 64) return false;
+    int alen = read<int>(e + OFF_ARRAY_LENGTH);
+    if (alen < c || alen > 100000) return false;
+
+    int good = 0;
+    for (int i = 0; i < c && i < 10; ++i)
+    {
+        uintptr_t ch = 0, tr = 0;
+        if (!readPtr(e + 0x20 + (uintptr_t)i * ENTRY_STRIDE + OFF_ENTRY_VALUE, &ch)) continue;
+        if (!readPtr(ch + OFF_CHAR_TRANSFORM, &tr)) continue;
+        Vec3 p = { 0, 0, 0 };
+        if (readVec(tr + OFF_POS_X, &p)) ++good;
+    }
+    if (good < 2) return false;
+
+    uintptr_t cd = 0, ce = 0;
+    if (!readPtr(w + OFF_WEM_CONTAINERS, &cd)) return false;
+    if (!readPtr(cd + OFF_DICT_ENTRIES, &ce)) return false;
+    int cc = read<int>(cd + OFF_DICT_COUNT);
+    if (cc < 0 || cc > 4096) return false;
+
+    return true;
+}
+
+static void startBlindScan()
+{
+    if (g_scanning.exchange(true)) return;
+    std::thread([]{
+        logf(L"scanning heap for world entities...");
+        buildRanges();
+        size_t budget = 800ull * 1024 * 1024;
+        size_t tested = 0;
+        std::vector<uint8_t> buf;
+        MEMORY_BASIC_INFORMATION m = { 0 };
+        uintptr_t a = 0x10000;
+        while (queryRegion(a, &m) && budget && g_running.load())
+        {
+            uintptr_t nx = (uintptr_t)m.BaseAddress + m.RegionSize;
+            bool ok = m.State == MEM_COMMIT && m.Type != MEM_IMAGE && !(m.Protect & PAGE_GUARD) &&
+                      (m.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && m.RegionSize <= 32ull * 1024ull * 1024ull;
+            if (ok)
+            {
+                buf.resize(m.RegionSize);
+                if (readRaw((uintptr_t)m.BaseAddress, buf.data(), m.RegionSize))
+                {
+                    budget -= m.RegionSize;
+                    size_t n = buf.size() / 8;
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        uintptr_t v = 0;
+                        memcpy(&v, buf.data() + i * 8, 8);
+                        if (!v || (v & 7) || v < 0x10000) continue;
+                        if (!inRanges(v)) continue;
+                        if (++tested > 5000000) { budget = 0; break; }
+                        if (blindWorldOk(v))
+                        {
+                            g_world = v;
+                            g_worldModel = 0;
+                            g_lastUpdScan = 0;
+                            logf(L"world entities %p", (void*)v);
+                            g_scanning = false;
+                            return;
+                        }
+                    }
+                }
+            }
+            if (nx <= a) break;
+            a = nx;
+        }
+        logf(L"scan done, %zu candidates", tested);
+        g_scanning = false;
+    }).detach();
 }
 
 static bool updaterOk(uintptr_t bu, uintptr_t bem, uintptr_t world)
@@ -1576,6 +1737,7 @@ static LRESULT CALLBACK GuiProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             g_lastStatic = 0;
             g_lastUpdScan = 0;
             logf(L"re-resolving");
+            startBlindScan();
             return 0;
         }
         return 0;
@@ -1729,10 +1891,29 @@ static void workerThread()
 
         refreshStatics();
 
-        if (cfg.instantLoot)
+        if (g_world || cfg.instantLoot)
         {
             uintptr_t bu = ensureUpdater();
-            if (bu) instantLoot(bu);
+            if (bu)
+            {
+                if (cfg.instantLoot) instantLoot(bu);
+
+                if (!g_world)
+                {
+                    uintptr_t bem = 0, w = 0;
+                    if (readPtr(bu + OFF_UPD_BEM, &bem) && readPtr(bem + OFF_BEM_WORLD, &w) && validEntitiesModel(w))
+                    {
+                        g_world = w;
+                        logf(L"world via updater %p", (void*)w);
+                    }
+                }
+            }
+        }
+
+        if (!g_world && !g_scanning.load() && GetTickCount() - g_lastBlind > 4000)
+        {
+            g_lastBlind = GetTickCount();
+            startBlindScan();
         }
 
         if ((cfg.esp || aimActive()) && g_world && g_camOk) snapshotEntities();
@@ -1895,7 +2076,7 @@ int main(int argc, char** argv)
 
     logf(L"attached to pid %lu", pid);
     logf(L"%s opens this menu", keyName(cfg.menuKey).c_str());
-    logf(L"if ESP is empty: toggle ESP, check status line");
+    logf(L"ESP needs a live match, not the menu");
 
     MSG msg = { 0 };
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
