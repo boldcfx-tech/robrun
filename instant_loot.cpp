@@ -15,7 +15,7 @@
 
 // ------------------------------------------------------------------ config
 // Fallback keyword used when no process name is given on the command line.
-static const wchar_t* DEFAULT_KEYWORD = L"robrun";
+static const wchar_t* DEFAULT_KEYWORD = L"ROB RUN";
 
 #define USE_SIGNATURE   1
 
