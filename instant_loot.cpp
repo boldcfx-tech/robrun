@@ -25,27 +25,32 @@
 #pragma comment(lib, "ntdll.lib")
 
 // ------------------------------------------------------------------ config
-// Fallback keyword used when no process name is given on the command line.
 static const wchar_t* DEFAULT_KEYWORD = L"ROB RUN";
 
 #define USE_SIGNATURE   1
 
-static const char* BUPDATER_PATTERN = "48 8B 05 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ??";
+// 64-bit: mov rax,[rip+disp32] ; mov rcx,[rax+disp32]
+static const char* BUPDATER_PATTERN_64 = "48 8B 05 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ??";
+static const int   BUPDATER_PATTERN_OFFSET_64 = 3;   // disp32 inside a 7-byte insn
 
-static const int  BUPDATER_PATTERN_OFFSET = 3;
+// 32-bit: mov eax,[disp32] ; mov ecx,[eax+disp32]
+static const char* BUPDATER_PATTERN_32 = "8B 05 ?? ?? ?? ?? 8B 88 ?? ?? ?? ??";
+static const int   BUPDATER_PATTERN_OFFSET_32 = 2;   // disp32 inside a 6-byte insn
 
-static const bool BUPDATER_PATTERN_DEREF  = true;
+static const bool BUPDATER_PATTERN_DEREF = true;
 
 static const uintptr_t BUPDATER_STATIC_RVA = 0x0000000;
 
 static const DWORD WATCH_INTERVAL = 100;
 
-// ------------------------------------------------------------------ memory
+// ------------------------------------------------------------------ state
 static HANDLE    g_proc = nullptr;
 static uintptr_t g_base = 0;
 static size_t    g_size = 0;
 static wchar_t   g_procName[MAX_PATH] = L"";
+static size_t    g_ptrSize = 8;      // 4 for WOW64 targets, 8 for native x64
 
+// ------------------------------------------------------------------ memory
 template <typename T>
 static T read(uintptr_t addr)
 {
@@ -63,6 +68,20 @@ static bool write(uintptr_t addr, T value)
     SIZE_T put = 0;
     return WriteProcessMemory(g_proc, reinterpret_cast<LPVOID>(addr), &value, sizeof(T), &put)
            && put == sizeof(T);
+}
+
+// Pointer-sized read. Returns false on a null or unreadable pointer.
+static bool readPtr(uintptr_t addr, uintptr_t* out)
+{
+    if (g_ptrSize == 4)
+    {
+        const uint32_t v = read<uint32_t>(addr);
+        *out = v;
+        return v != 0;
+    }
+    const uint64_t v = read<uint64_t>(addr);
+    *out = static_cast<uintptr_t>(v);
+    return v != 0;
 }
 
 // ------------------------------------------------------------------ elevation
@@ -137,7 +156,6 @@ static bool wcontains(const std::wstring& hay, const std::wstring& needle)
     return false;
 }
 
-// One EnumWindows pass: pid -> first visible non-empty window title.
 static std::vector<std::pair<DWORD, std::wstring>> windowTitles()
 {
     std::vector<std::pair<DWORD, std::wstring>> out;
@@ -199,14 +217,13 @@ static DWORD findPidExact(const wchar_t* name)
     return 0;
 }
 
-// Higher score = better evidence. exe name always beats window title.
 static int scoreMatch(const std::wstring& exe, const std::wstring& title, const std::wstring& key)
 {
     int s = 0;
-    if (exe == key || exe == key + L"exe") s = 100;   // "robrun" / "robrunexe"
-    else if (exe.rfind(key, 0) == 0)       s = 60;    // exe starts with key
-    else if (wcontains(exe, key))          s = 40;    // exe contains key
-    if (wcontains(title, key)) s = (std::max)(s, 5);  // title-only = weakest
+    if (exe == key || exe == key + L"exe") s = 100;
+    else if (exe.rfind(key, 0) == 0)       s = 60;
+    else if (wcontains(exe, key))          s = 40;
+    if (wcontains(title, key)) s = (std::max)(s, 5);
     return s;
 }
 
@@ -250,7 +267,22 @@ static bool exeNameForPid(DWORD pid)
     return false;
 }
 
+// ------------------------------------------------------------------ bitness
+static void detectBitness()
+{
+    BOOL wow = FALSE;
+    if (IsWow64Process(g_proc, &wow) && wow)
+    {
+        g_ptrSize = 4;
+        printf("[+] target is 32-bit (WOW64)\n");
+        return;
+    }
+    g_ptrSize = 8;
+    printf("[+] target is 64-bit\n");
+}
+
 // ------------------------------------------------------------------ module base
+// Accepts both x86 and x64 images; records the pointer size from the header.
 static bool validateImageBase(uintptr_t base, size_t* sizeOut)
 {
     if (!base) return false;
@@ -260,18 +292,24 @@ static bool validateImageBase(uintptr_t base, size_t* sizeOut)
         return false;
     if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) return false;
 
-    IMAGE_NT_HEADERS64 nt{};
+    // The 32-bit header covers every field we need; the prefix is identical
+    // for both machines and SizeOfImage sits at the same offset.
+    IMAGE_NT_HEADERS32 nt{};
     if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(base + dos.e_lfanew), &nt, sizeof(nt), nullptr))
         return false;
     if (nt.Signature != IMAGE_NT_SIGNATURE) return false;
-    if (nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
     if (!nt.OptionalHeader.SizeOfImage) return false;
+
+    const WORD machine = nt.FileHeader.Machine;
+    if (machine == IMAGE_FILE_MACHINE_I386)        g_ptrSize = 4;
+    else if (machine == IMAGE_FILE_MACHINE_AMD64)  g_ptrSize = 8;
+    else if (machine == IMAGE_FILE_MACHINE_ARM64)  g_ptrSize = 8;
+    else return false;
 
     if (sizeOut) *sizeOut = nt.OptionalHeader.SizeOfImage;
     return true;
 }
 
-// 1) Loader snapshot. Transiently fails while the loader lock is held.
 static bool baseFromToolhelp(DWORD pid)
 {
     for (int attempt = 0; attempt < 3; ++attempt)
@@ -303,7 +341,6 @@ static bool baseFromToolhelp(DWORD pid)
     return false;
 }
 
-// 2) psapi. The main executable is always module index 0.
 static bool baseFromPsapi()
 {
     HMODULE mods[512]{};
@@ -321,7 +358,8 @@ static bool baseFromPsapi()
     return true;
 }
 
-// 3) PEB -> Ldr -> InMemoryOrderModuleList. Bypasses the loader APIs entirely.
+// PEB walk. Uses ProcessWow64Information for 32-bit targets, since the native
+// PEB of a WOW64 process only lists the 64-bit modules.
 static bool baseFromPeb()
 {
     using NtQIP = NTSTATUS (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -329,25 +367,45 @@ static bool baseFromPeb()
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
     if (!ntqip) return false;
 
-    PROCESS_BASIC_INFORMATION pbi{};
-    if (ntqip(g_proc, 0 /* ProcessBasicInformation */, &pbi, sizeof(pbi), nullptr) < 0) return false;
-    if (!pbi.PebBaseAddress) return false;
+    uintptr_t peb = 0;
+    uintptr_t ldrOff, listOff, linksOff, dllBaseOff, nameLenOff, nameBufOff;
 
-    const uintptr_t ldr = read<uintptr_t>(reinterpret_cast<uintptr_t>(pbi.PebBaseAddress) + 0x18);
-    if (!ldr) return false;
+    if (g_ptrSize == 4)
+    {
+        ULONG_PTR peb32 = 0;
+        if (ntqip(g_proc, 26 /* ProcessWow64Information */, &peb32, sizeof(peb32), nullptr) < 0) return false;
+        if (!peb32) return false;
+        peb = static_cast<uintptr_t>(peb32);
+        ldrOff = 0x0C; listOff = 0x14; linksOff = 0x08;
+        dllBaseOff = 0x18; nameLenOff = 0x2C; nameBufOff = 0x30;
+    }
+    else
+    {
+        PROCESS_BASIC_INFORMATION pbi{};
+        if (ntqip(g_proc, 0 /* ProcessBasicInformation */, &pbi, sizeof(pbi), nullptr) < 0) return false;
+        if (!pbi.PebBaseAddress) return false;
+        peb = reinterpret_cast<uintptr_t>(pbi.PebBaseAddress);
+        ldrOff = 0x18; listOff = 0x20; linksOff = 0x10;
+        dllBaseOff = 0x30; nameLenOff = 0x58; nameBufOff = 0x60;
+    }
 
-    const uintptr_t head = ldr + 0x20;              // InMemoryOrderModuleList
-    uintptr_t cur = read<uintptr_t>(head);
-    if (!cur) return false;
+    uintptr_t ldr = 0;
+    if (!readPtr(peb + ldrOff, &ldr)) return false;
+
+    const uintptr_t head = ldr + listOff;
+    uintptr_t cur = 0;
+    if (!readPtr(head, &cur)) return false;
 
     for (int i = 0; i < 512 && cur && cur != head; ++i)
     {
-        const uintptr_t entry = cur - 0x10;         // InMemoryOrderLinks sits at +0x10
-        const uintptr_t dllBase = read<uintptr_t>(entry + 0x30);
-        const USHORT nameLen = read<USHORT>(entry + 0x58);        // BaseDllName.Length
-        const uintptr_t nameBuf = read<uintptr_t>(entry + 0x60);  // BaseDllName.Buffer
+        const uintptr_t entry = cur - linksOff;
+        uintptr_t dllBase = 0;
+        uintptr_t nameBuf = 0;
+        const USHORT nameLen = read<USHORT>(entry + nameLenOff);
 
-        if (dllBase && nameLen && nameLen < 512 && nameBuf)
+        if (readPtr(entry + dllBaseOff, &dllBase) && dllBase &&
+            nameLen && nameLen < 512 &&
+            readPtr(entry + nameBufOff, &nameBuf) && nameBuf)
         {
             wchar_t name[256]{};
             if (ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(nameBuf), name, nameLen, nullptr))
@@ -365,12 +423,11 @@ static bool baseFromPeb()
                 }
             }
         }
-        cur = read<uintptr_t>(cur);                 // Flink
+        readPtr(cur, &cur);
     }
     return false;
 }
 
-// 4) Last resort: lowest committed image region that parses as a valid x64 PE.
 static bool baseFromImageScan()
 {
     MEMORY_BASIC_INFORMATION mbi{};
@@ -461,18 +518,26 @@ static uintptr_t scanPattern(const std::vector<int>& pat)
 static uintptr_t findBattleUpdater(bool verbose)
 {
 #if USE_SIGNATURE
+    const bool is32 = (g_ptrSize == 4);
+    const char* src = is32 ? BUPDATER_PATTERN_32 : BUPDATER_PATTERN_64;
+
     std::vector<int> pat;
-    if (!parsePattern(BUPDATER_PATTERN, pat)) { printf("[!] bad pattern\n"); return 0; }
+    if (!parsePattern(src, pat)) { printf("[!] bad pattern\n"); return 0; }
 
     uintptr_t hit = scanPattern(pat);
     if (!hit) { if (verbose) printf("[!] pattern not found\n"); return 0; }
 
-    // mov rax, [rip+disp32] -> resolve the displacement against the end of the
-    // 7-byte instruction, then deref the global slot to get the object.
-    const int32_t disp = read<int32_t>(hit + BUPDATER_PATTERN_OFFSET);
+    if (is32)
+    {
+        // x86 encodes the operand as an absolute address, not RIP-relative.
+        const uint32_t abs = read<uint32_t>(hit + BUPDATER_PATTERN_OFFSET_32);
+        if (!abs) return 0;
+        return BUPDATER_PATTERN_DEREF ? static_cast<uintptr_t>(read<uint32_t>(abs)) : abs;
+    }
+
+    const int32_t disp = read<int32_t>(hit + BUPDATER_PATTERN_OFFSET_64);
     const uintptr_t slot = hit + 7 + static_cast<uintptr_t>(static_cast<intptr_t>(disp));
-    const uintptr_t obj  = read<uintptr_t>(slot);
-    return BUPDATER_PATTERN_DEREF ? obj : slot;
+    return BUPDATER_PATTERN_DEREF ? static_cast<uintptr_t>(read<uint64_t>(slot)) : slot;
 #else
     if (!BUPDATER_STATIC_RVA) { printf("[!] set BUPDATER_STATIC_RVA\n"); return 0; }
     return read<uintptr_t>(g_base + BUPDATER_STATIC_RVA);
@@ -486,33 +551,37 @@ static void InstantLoot(uintptr_t battleUpdater)
         return;
 
     // BattleEntitiesUpdater -> BattleScreenContent -> InventoryRevealViewDescriptions
-    uintptr_t content = read<uintptr_t>(battleUpdater + 0x68);
-    if (!content)
+    uintptr_t content = 0;
+    if (!readPtr(battleUpdater + 0x68, &content))
         return;
 
-    uintptr_t inst = read<uintptr_t>(content + 0x540);
-    if (!inst)
+    uintptr_t inst = 0;
+    if (!readPtr(content + 0x540, &inst))
         return;
 
     // Delay between cells on the main instance (TimeToOneCellBorder)
     write<float>(inst + 0x58, 0.0001f);
 
     // List<Pair> at +0x18
-    uintptr_t list = read<uintptr_t>(inst + 0x18);
-    if (!list)
+    uintptr_t list = 0;
+    if (!readPtr(inst + 0x18, &list))
         return;
 
-    uintptr_t items = read<uintptr_t>(list + 0x10);
-    int size = read<int>(list + 0x18);
-    if (!items || size <= 0 || size > 500)
+    uintptr_t items = 0;
+    if (!readPtr(list + 0x10, &items))
+        return;
+
+    const int size = read<int>(list + 0x18);
+    if (size <= 0 || size > 500)
         return;
 
     // Loop items (stride 0x18, Description* at +0x10)
     for (int i = 0; i < size; ++i)
     {
-        uintptr_t pair = items + 0x20 + (i * 0x18);
-        uintptr_t desc = read<uintptr_t>(pair + 0x10);
-        if (!desc)
+        const uintptr_t pair = items + 0x20 + (static_cast<uintptr_t>(i) * 0x18);
+
+        uintptr_t desc = 0;
+        if (!readPtr(pair + 0x10, &desc))
             continue;
 
         // Shine Duration (inline struct 0x18 + 0x28)
@@ -573,7 +642,7 @@ int main(int argc, char** argv)
             wcscpy_s(g_procName, nameArg);
         else
         {
-            pid = findPidKeyword(nameArg);          // sets g_procName itself on success
+            pid = findPidKeyword(nameArg);
             if (pid) printf("[+] matched \"%ls\" (%lu)\n", g_procName, pid);
         }
     }
@@ -610,6 +679,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    detectBitness();
+
     bool haveBase = false;
     for (int i = 0; i < 10 && !haveBase; ++i)
     {
@@ -618,13 +689,13 @@ int main(int argc, char** argv)
     }
     if (!haveBase)
     {
-        printf("[!] all module base strategies failed (%lu)\n", GetLastError());
-        printf("    target may be protected - try --pid %lu from an elevated console\n", pid);
+        printf("[!] all module base strategies failed\n");
+        printf("    note: error 87 here is the VirtualQueryEx loop exit, not the cause\n");
         system("pause");
         return 1;
     }
 
-    printf("[+] base %p  size %zx\n", (void*)g_base, g_size);
+    printf("[+] base %p  size %zx  ptr %zu\n", (void*)g_base, g_size, g_ptrSize);
 
     if (!watch)
     {
