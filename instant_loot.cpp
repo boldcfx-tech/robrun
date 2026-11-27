@@ -9,6 +9,8 @@
 #include <vector>
 #include <string>
 
+#pragma comment(lib, "user32.lib")
+
 // ------------------------------------------------------------------ config
 // Fallback keyword used when no process name is given on the command line.
 static const wchar_t* DEFAULT_KEYWORD = L"robrun";
