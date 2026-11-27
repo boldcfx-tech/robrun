@@ -1,0 +1,16 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Compile
+        run: cl /nologo /O2 /EHsc /std:c++17 /MT instant_loot.cpp /Fe:instant_loot.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instant_loot
+          path: instant_loot.exe
+          retention-days: 7
