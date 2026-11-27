@@ -4,6 +4,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <winternl.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
 
