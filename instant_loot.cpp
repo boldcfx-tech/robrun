@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <winternl.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,8 @@
 #include <algorithm>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "ntdll.lib")
 
 // ------------------------------------------------------------------ config
 // Fallback keyword used when no process name is given on the command line.
@@ -54,6 +57,58 @@ static bool write(uintptr_t addr, T value)
     SIZE_T put = 0;
     return WriteProcessMemory(g_proc, reinterpret_cast<LPVOID>(addr), &value, sizeof(T), &put)
            && put == sizeof(T);
+}
+
+// ------------------------------------------------------------------ elevation
+static bool isElevated()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el{};
+    DWORD cb = sizeof(el);
+    bool elev = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &cb) && el.TokenIsElevated;
+    CloseHandle(tok);
+    return elev;
+}
+
+static bool relaunchElevated()
+{
+    wchar_t exe[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
+
+    std::wstring params;
+    for (int i = 1; i < __argc; ++i) { params += L'"'; params += __wargv[i]; params += L"\" "; }
+
+    SHELLEXECUTEINFOW sei{ sizeof(sei) };
+    sei.fMask   = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb  = L"runas";
+    sei.lpFile  = exe;
+    sei.lpParameters = params.empty() ? nullptr : params.c_str();
+    sei.nShow   = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) return false;
+    if (sei.hProcess) CloseHandle(sei.hProcess);
+    return true;
+}
+
+static bool enableDebugPrivilege()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return false;
+
+    LUID luid{};
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) { CloseHandle(tok); return false; }
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    SetLastError(ERROR_SUCCESS);
+    bool ok = AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), nullptr, nullptr)
+              && GetLastError() == ERROR_SUCCESS;
+    CloseHandle(tok);
+    return ok;
 }
 
 // ------------------------------------------------------------------ process
@@ -189,25 +244,164 @@ static bool exeNameForPid(DWORD pid)
     return false;
 }
 
-static bool resolveModuleBase(DWORD pid, const wchar_t* module)
+// ------------------------------------------------------------------ module base
+static bool validateImageBase(uintptr_t base, size_t* sizeOut)
 {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return false;
+    if (!base) return false;
 
-    MODULEENTRY32W me{ sizeof(me) };
-    bool found = false;
-    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+    IMAGE_DOS_HEADER dos{};
+    if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(base), &dos, sizeof(dos), nullptr))
+        return false;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) return false;
+
+    IMAGE_NT_HEADERS64 nt{};
+    if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(base + dos.e_lfanew), &nt, sizeof(nt), nullptr))
+        return false;
+    if (nt.Signature != IMAGE_NT_SIGNATURE) return false;
+    if (nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
+    if (!nt.OptionalHeader.SizeOfImage) return false;
+
+    if (sizeOut) *sizeOut = nt.OptionalHeader.SizeOfImage;
+    return true;
+}
+
+// 1) Loader snapshot. Transiently fails while the loader lock is held.
+static bool baseFromToolhelp(DWORD pid)
+{
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
-        if (_wcsicmp(me.szModule, module) == 0)
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap != INVALID_HANDLE_VALUE)
         {
-            g_base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
-            g_size = me.modBaseSize;
-            found  = true;
-            break;
+            MODULEENTRY32W me{ sizeof(me) };
+            bool found = false;
+            for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+            {
+                if (_wcsicmp(me.szModule, g_procName) == 0)
+                {
+                    size_t size = 0;
+                    if (validateImageBase(reinterpret_cast<uintptr_t>(me.modBaseAddr), &size))
+                    {
+                        g_base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+                        g_size = size;
+                        found  = true;
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+            if (found) return true;
         }
+        Sleep(20);
     }
-    CloseHandle(snap);
-    return found;
+    return false;
+}
+
+// 2) psapi. The main executable is always module index 0.
+static bool baseFromPsapi()
+{
+    HMODULE mods[512]{};
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(g_proc, mods, sizeof(mods), &needed, LIST_MODULES_ALL))
+        return false;
+    if (needed < sizeof(HMODULE) || !mods[0]) return false;
+
+    size_t size = 0;
+    uintptr_t base = reinterpret_cast<uintptr_t>(mods[0]);
+    if (!validateImageBase(base, &size)) return false;
+
+    g_base = base;
+    g_size = size;
+    return true;
+}
+
+// 3) PEB -> Ldr -> InMemoryOrderModuleList. Bypasses the loader APIs entirely.
+static bool baseFromPeb()
+{
+    using NtQIP = NTSTATUS (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto ntqip = reinterpret_cast<NtQIP>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (!ntqip) return false;
+
+    PROCESS_BASIC_INFORMATION pbi{};
+    if (ntqip(g_proc, 0 /* ProcessBasicInformation */, &pbi, sizeof(pbi), nullptr) < 0) return false;
+    if (!pbi.PebBaseAddress) return false;
+
+    const uintptr_t ldr = read<uintptr_t>(reinterpret_cast<uintptr_t>(pbi.PebBaseAddress) + 0x18);
+    if (!ldr) return false;
+
+    const uintptr_t head = ldr + 0x20;              // InMemoryOrderModuleList
+    uintptr_t cur = read<uintptr_t>(head);
+    if (!cur) return false;
+
+    for (int i = 0; i < 512 && cur && cur != head; ++i)
+    {
+        const uintptr_t entry = cur - 0x10;         // InMemoryOrderLinks sits at +0x10
+        const uintptr_t dllBase = read<uintptr_t>(entry + 0x30);
+        const USHORT nameLen = read<USHORT>(entry + 0x58);        // BaseDllName.Length
+        const uintptr_t nameBuf = read<uintptr_t>(entry + 0x60);  // BaseDllName.Buffer
+
+        if (dllBase && nameLen && nameLen < 512 && nameBuf)
+        {
+            wchar_t name[256]{};
+            if (ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(nameBuf), name, nameLen, nullptr))
+            {
+                name[nameLen / sizeof(wchar_t)] = L'\0';
+                if (_wcsicmp(name, g_procName) == 0)
+                {
+                    size_t size = 0;
+                    if (validateImageBase(dllBase, &size))
+                    {
+                        g_base = dllBase;
+                        g_size = size;
+                        return true;
+                    }
+                }
+            }
+        }
+        cur = read<uintptr_t>(cur);                 // Flink
+    }
+    return false;
+}
+
+// 4) Last resort: lowest committed image region that parses as a valid x64 PE.
+static bool baseFromImageScan()
+{
+    MEMORY_BASIC_INFORMATION mbi{};
+    uintptr_t addr = 0;
+    uintptr_t lowest = 0;
+    size_t lowestSize = 0;
+
+    while (VirtualQueryEx(g_proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)))
+    {
+        if (mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT && mbi.AllocationBase)
+        {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            size_t size = 0;
+            if (validateImageBase(base, &size) && (lowest == 0 || base < lowest))
+            {
+                lowest = base;
+                lowestSize = size;
+            }
+        }
+        const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+    }
+
+    if (!lowest) return false;
+    g_base = lowest;
+    g_size = lowestSize;
+    return true;
+}
+
+static bool resolveModuleBase(DWORD pid)
+{
+    if (baseFromToolhelp(pid)) { printf("[+] base via toolhelp\n"); return true; }
+    if (baseFromPsapi())       { printf("[+] base via psapi\n");    return true; }
+    if (baseFromPeb())         { printf("[+] base via PEB walk\n"); return true; }
+    if (baseFromImageScan())   { printf("[+] base via image scan\n"); return true; }
+    return false;
 }
 
 // ------------------------------------------------------------------ pattern
@@ -328,6 +522,15 @@ int main(int argc, char** argv)
 {
     SetConsoleTitleW(L"instant loot");
 
+    if (!isElevated())
+    {
+        printf("[!] not elevated - requesting UAC\n");
+        if (relaunchElevated()) return 0;
+        printf("[!] relaunch failed (%lu), continuing unelevated\n", GetLastError());
+    }
+    if (!enableDebugPrivilege())
+        printf("[!] SeDebugPrivilege not enabled (%lu)\n", GetLastError());
+
     bool watch = false;
     wchar_t nameArg[MAX_PATH] = L"";
     DWORD pidArg = 0;
@@ -392,15 +595,25 @@ int main(int argc, char** argv)
     g_proc = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
                          | PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!g_proc)
+        g_proc = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
+                             | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!g_proc)
     {
         printf("[!] OpenProcess failed (%lu) - run as admin\n", GetLastError());
         system("pause");
         return 1;
     }
 
-    if (!resolveModuleBase(pid, g_procName))
+    bool haveBase = false;
+    for (int i = 0; i < 10 && !haveBase; ++i)
     {
-        printf("[!] module base lookup failed (%lu)\n", GetLastError());
+        haveBase = resolveModuleBase(pid);
+        if (!haveBase) Sleep(150);
+    }
+    if (!haveBase)
+    {
+        printf("[!] all module base strategies failed (%lu)\n", GetLastError());
+        printf("    target may be protected - try --pid %lu from an elevated console\n", pid);
         system("pause");
         return 1;
     }
