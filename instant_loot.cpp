@@ -1,6 +1,7 @@
-// instant_loot.cpp  —  build x64, run as admin
+// instant_loot.cpp  —  build x64 (or x86 to match the game), run as admin
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -8,33 +9,26 @@
 #include <string>
 
 // ------------------------------------------------------------------ config
-#define PROCESS_NAME   L"Albion-Online.exe"
+// Fallback keyword used when no process name is given on the command line.
+static const wchar_t* DEFAULT_KEYWORD = L"robrun";
 
-// Pick ONE resolution method:
-#define USE_SIGNATURE   1     // 1 = AOB scan, 0 = static pointer
+#define USE_SIGNATURE   1
 
-// --- EDIT ME (signature method) ---
-// Pattern that lands on / near the BattleEntitiesUpdater reference.
 static const char* BUPDATER_PATTERN = "48 8B 05 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ??";
 
-// Distance from the pattern match to the operand / instruction end.
 static const int  BUPDATER_PATTERN_OFFSET = 3;
 
-// true  -> read<uintptr_t>(match + offset)   (match points at a pointer)
-// false -> match + offset IS the instance address
 static const bool BUPDATER_PATTERN_DEREF  = true;
 
-// --- EDIT ME (static method) ---
-// RVA of the BattleEntitiesUpdater pointer inside the module.
 static const uintptr_t BUPDATER_STATIC_RVA = 0x0000000;
 
-// How often --watch re-applies the patch, milliseconds.
 static const DWORD WATCH_INTERVAL = 100;
 
 // ------------------------------------------------------------------ memory
-static HANDLE    g_proc  = nullptr;
-static uintptr_t g_base  = 0;
-static size_t    g_size  = 0;
+static HANDLE    g_proc = nullptr;
+static uintptr_t g_base = 0;
+static size_t    g_size = 0;
+static wchar_t   g_procName[MAX_PATH] = L"";
 
 template <typename T>
 static T read(uintptr_t addr)
@@ -56,19 +50,79 @@ static bool write(uintptr_t addr, T value)
 }
 
 // ------------------------------------------------------------------ process
-static DWORD findPid(const wchar_t* name)
+struct Cand { DWORD pid; std::wstring exe; std::wstring title; };
+
+static bool hasWindow(DWORD pid)
 {
+    struct Ctx { DWORD pid; bool found; } ctx{ pid, false };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = reinterpret_cast<Ctx*>(lp);
+        DWORD owner = 0;
+        GetWindowThreadProcessId(h, &owner);
+        if (owner == c->pid && IsWindowVisible(h) && GetWindow(h, GW_OWNER) == nullptr)
+        {
+            c->found = true;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+static std::wstring windowTitle(DWORD pid)
+{
+    struct Ctx { DWORD pid; std::wstring title; } ctx{ pid, L"" };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = reinterpret_cast<Ctx*>(lp);
+        DWORD owner = 0;
+        GetWindowThreadProcessId(h, &owner);
+        if (owner == c->pid && IsWindowVisible(h))
+        {
+            wchar_t buf[256]{};
+            GetWindowTextW(h, buf, 255);
+            if (buf[0]) { c->title = buf; return FALSE; }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.title;
+}
+
+static std::vector<Cand> snapshotProcs()
+{
+    std::vector<Cand> out;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+    if (snap == INVALID_HANDLE_VALUE) return out;
 
     PROCESSENTRY32W pe{ sizeof(pe) };
-    DWORD pid = 0;
     for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
-    {
-        if (_wcsicmp(pe.szExeFile, name) == 0) { pid = pe.th32ProcessID; break; }
-    }
+        out.push_back({ pe.th32ProcessID, pe.szExeFile, L"" });
+
     CloseHandle(snap);
-    return pid;
+    return out;
+}
+
+static DWORD findPidExact(const wchar_t* name)
+{
+    for (auto& c : snapshotProcs())
+        if (_wcsicmp(c.exe.c_str(), name) == 0) return c.pid;
+    return 0;
+}
+
+static DWORD findPidKeyword(const wchar_t* keyword)
+{
+    std::vector<Cand> hits;
+    for (auto& c : snapshotProcs())
+    {
+        if (c.pid == GetCurrentProcessId()) continue;
+        if (StrStrIW(c.exe.c_str(), keyword)) hits.push_back(c);
+    }
+    if (hits.size() == 1) { wcscpy_s(g_procName, hits[0].exe.c_str()); return hits[0].pid; }
+
+    if (hits.empty()) return 0;
+
+    printf("[?] %zu matches for \"%ls\" - pass one explicitly:\n", hits.size(), keyword);
+    for (auto& c : hits) printf("    %lu  %ls\n", c.pid, c.exe.c_str());
+    return 0;
 }
 
 static bool resolveModuleBase(DWORD pid, const wchar_t* module)
@@ -100,15 +154,14 @@ static bool parsePattern(const char* in, std::vector<int>& out)
     {
         if (*p == ' ') { ++p; continue; }
         if (p[0] == '?' && p[1] == '?') { out.push_back(-1); p += 2; continue; }
-        int hi = -1, lo = -1;
         auto nib = [](char c) -> int {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
             if (c >= 'A' && c <= 'F') return c - 'A' + 10;
             return -1;
         };
-        hi = nib(p[0]);
-        lo = p[1] ? nib(p[1]) : -1;
+        int hi = nib(p[0]);
+        int lo = p[1] ? nib(p[1]) : -1;
         if (hi < 0 || lo < 0) return false;
         out.push_back((hi << 4) | lo);
         p += 2;
@@ -206,14 +259,54 @@ static void InstantLoot(uintptr_t battleUpdater)
 int main(int argc, char** argv)
 {
     SetConsoleTitleW(L"instant loot");
-    bool watch = false;
-    for (int i = 1; i < argc; ++i)
-        if (!_stricmp(argv[i], "--watch")) watch = true;
 
-    DWORD pid = findPid(PROCESS_NAME);
+    bool watch = false;
+    bool list  = false;
+    wchar_t nameArg[MAX_PATH] = L"";
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if (!_stricmp(argv[i], "--watch")) { watch = true; continue; }
+        if (!_stricmp(argv[i], "--list"))  { list  = true; continue; }
+        MultiByteToWideChar(CP_ACP, 0, argv[i], -1, nameArg, MAX_PATH);
+    }
+
+    if (list)
+    {
+        printf("pid      exe                             title\n");
+        printf("---------------------------------------------------------------\n");
+        for (auto& c : snapshotProcs())
+        {
+            if (c.pid == GetCurrentProcessId()) continue;
+            if (!hasWindow(c.pid)) continue;
+            printf("%-8lu %-31ls %ls\n", c.pid, c.exe.c_str(), windowTitle(c.pid).c_str());
+        }
+        printf("\nusage: instant_loot.exe <exe name> [--watch]\n");
+        system("pause");
+        return 0;
+    }
+
+    DWORD pid = 0;
+    if (nameArg[0])
+    {
+        wcscpy_s(g_procName, nameArg);
+        pid = findPidExact(nameArg);
+        if (!pid)
+        {
+            printf("[!] no process named \"%ls\"\n", nameArg);
+            DWORD guess = findPidKeyword(nameArg);
+            if (guess) { pid = guess; printf("[+] using \"%ls\" (%lu)\n", g_procName, pid); }
+        }
+    }
+    else
+    {
+        pid = findPidKeyword(DEFAULT_KEYWORD);
+        if (pid) printf("[+] auto-detected \"%ls\" (%lu)\n", g_procName, pid);
+    }
+
     if (!pid)
     {
-        printf("[!] %ls not running\n", PROCESS_NAME);
+        printf("[!] target not found - run with --list to see real names\n");
         system("pause");
         return 1;
     }
@@ -222,12 +315,12 @@ int main(int argc, char** argv)
                          | PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!g_proc)
     {
-        printf("[!] OpenProcess failed (%lu) - run as admin\n", GetLastError());
+        printf("[!] OpenProcess failed (%lu) - run as admin, and match bitness\n", GetLastError());
         system("pause");
         return 1;
     }
 
-    if (!resolveModuleBase(pid, PROCESS_NAME))
+    if (!resolveModuleBase(pid, g_procName))
     {
         printf("[!] module base lookup failed (%lu)\n", GetLastError());
         system("pause");
