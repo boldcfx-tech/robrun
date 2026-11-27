@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <utility>
+#include <algorithm>
 
 #pragma comment(lib, "user32.lib")
 
@@ -125,7 +126,7 @@ static void printList()
     printf("pid      exe                             title\n");
     printf("---------------------------------------------------------------\n");
     for (auto& c : snapshotProcs(true))
-        printf("%-8lu %-31ls %ls\n", c.pid, c.exe.c_str(), c.title.c_str());
+        printf("%-8lu %-31ls %.60ls\n", c.pid, c.exe.c_str(), c.title.c_str());
     printf("\nusage: instant_loot.exe <exe name | --pid N> [--watch]\n");
 }
 
@@ -136,24 +137,47 @@ static DWORD findPidExact(const wchar_t* name)
     return 0;
 }
 
+// Higher score = better evidence. exe name always beats window title.
+static int scoreMatch(const std::wstring& exe, const std::wstring& title, const std::wstring& key)
+{
+    int s = 0;
+    if (exe == key || exe == key + L"exe") s = 100;   // "robrun" / "robrunexe"
+    else if (exe.rfind(key, 0) == 0)       s = 60;    // exe starts with key
+    else if (wcontains(exe, key))          s = 40;    // exe contains key
+    if (wcontains(title, key)) s = std::max(s, 5);    // title-only = weakest
+    return s;
+}
+
 static DWORD findPidKeyword(const wchar_t* keyword)
 {
     const std::wstring key = normalize(keyword);
     if (key.empty()) return 0;
 
     std::vector<Cand> hits;
+    std::vector<int>  scores;
+
     for (auto& c : snapshotProcs(true))
     {
-        if (wcontains(normalize(c.exe.c_str()), key) || wcontains(normalize(c.title.c_str()), key))
-            hits.push_back(c);
+        int s = scoreMatch(normalize(c.exe.c_str()), normalize(c.title.c_str()), key);
+        if (s > 0) { hits.push_back(c); scores.push_back(s); }
     }
-
-    if (hits.size() == 1) { wcscpy_s(g_procName, hits[0].exe.c_str()); return hits[0].pid; }
-
     if (hits.empty()) return 0;
 
-    printf("[?] %zu matches for \"%ls\" - pick one with --pid:\n", hits.size(), keyword);
-    for (auto& c : hits) printf("    %lu  %ls  %ls\n", c.pid, c.exe.c_str(), c.title.c_str());
+    const int best = *std::max_element(scores.begin(), scores.end());
+
+    std::vector<size_t> top;
+    for (size_t i = 0; i < hits.size(); ++i)
+        if (scores[i] == best) top.push_back(i);
+
+    if (top.size() == 1)
+    {
+        wcscpy_s(g_procName, hits[top[0]].exe.c_str());
+        return hits[top[0]].pid;
+    }
+
+    printf("[?] %zu equally-good matches for \"%ls\" - pick one with --pid:\n", top.size(), keyword);
+    for (size_t i : top)
+        printf("    %lu  %-31ls %.60ls\n", hits[i].pid, hits[i].exe.c_str(), hits[i].title.c_str());
     return 0;
 }
 
@@ -233,17 +257,21 @@ static uintptr_t scanPattern(const std::vector<int>& pat)
     return 0;
 }
 
-static uintptr_t findBattleUpdater()
+static uintptr_t findBattleUpdater(bool verbose)
 {
 #if USE_SIGNATURE
     std::vector<int> pat;
     if (!parsePattern(BUPDATER_PATTERN, pat)) { printf("[!] bad pattern\n"); return 0; }
 
     uintptr_t hit = scanPattern(pat);
-    if (!hit) { printf("[!] pattern not found\n"); return 0; }
+    if (!hit) { if (verbose) printf("[!] pattern not found\n"); return 0; }
 
-    uintptr_t addr = hit + BUPDATER_PATTERN_OFFSET;
-    return BUPDATER_PATTERN_DEREF ? read<uintptr_t>(addr) : addr;
+    // mov rax, [rip+disp32] -> resolve the displacement against the end of the
+    // 7-byte instruction, then deref the global slot to get the object.
+    const int32_t disp = read<int32_t>(hit + BUPDATER_PATTERN_OFFSET);
+    const uintptr_t slot = hit + 7 + static_cast<uintptr_t>(static_cast<intptr_t>(disp));
+    const uintptr_t obj  = read<uintptr_t>(slot);
+    return BUPDATER_PATTERN_DEREF ? obj : slot;
 #else
     if (!BUPDATER_STATIC_RVA) { printf("[!] set BUPDATER_STATIC_RVA\n"); return 0; }
     return read<uintptr_t>(g_base + BUPDATER_STATIC_RVA);
@@ -330,12 +358,12 @@ int main(int argc, char** argv)
     }
     else if (nameArg[0])
     {
-        wcscpy_s(g_procName, nameArg);
         pid = findPidExact(nameArg);
-        if (!pid)
+        if (pid)
+            wcscpy_s(g_procName, nameArg);
+        else
         {
-            printf("[!] no process named \"%ls\"\n", nameArg);
-            pid = findPidKeyword(nameArg);
+            pid = findPidKeyword(nameArg);          // sets g_procName itself on success
             if (pid) printf("[+] matched \"%ls\" (%lu)\n", g_procName, pid);
         }
     }
@@ -349,6 +377,13 @@ int main(int argc, char** argv)
     {
         printf("\n[!] target not found. windowed processes:\n\n");
         printList();
+        system("pause");
+        return 1;
+    }
+
+    if (!g_procName[0] && !exeNameForPid(pid))
+    {
+        printf("[!] could not resolve exe name for pid %lu\n", pid);
         system("pause");
         return 1;
     }
@@ -373,7 +408,7 @@ int main(int argc, char** argv)
 
     if (!watch)
     {
-        uintptr_t bu = findBattleUpdater();
+        uintptr_t bu = findBattleUpdater(true);
         printf("[+] battleUpdater %p\n", (void*)bu);
         InstantLoot(bu);
         printf("[+] done\n");
@@ -382,9 +417,13 @@ int main(int argc, char** argv)
     }
 
     printf("[+] watch mode, Ctrl+C to stop\n");
+    bool reported = false;
     for (;;)
     {
-        InstantLoot(findBattleUpdater());
+        uintptr_t bu = findBattleUpdater(!reported);
+        if (bu) reported = true;
+        else    reported = false;
+        InstantLoot(bu);
         Sleep(WATCH_INTERVAL);
     }
 }
