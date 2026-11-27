@@ -48,6 +48,8 @@ enum : uintptr_t
     OFF_BATTLE_CAM     = 0x358,
     OFF_BEM_WORLD      = 0x60,
 
+    OFF_WM_WORLD       = 0x38,   // WorldModel.WorldEntitiesModel
+
     OFF_WEM_CHARS      = 0x18,
     OFF_WEM_CONTAINERS = 0x20,
     OFF_WEM_LOOTS      = 0x38,
@@ -551,6 +553,7 @@ static bool  g_camOk = false;
 
 static uintptr_t g_camModel = 0;
 static uintptr_t g_world = 0;
+static uintptr_t g_worldModel = 0;
 static uintptr_t g_updater = 0;
 static DWORD     g_lastStatic = 0;
 static DWORD     g_lastUpdScan = 0;
@@ -588,7 +591,7 @@ static bool dictShape(uintptr_t dict, uintptr_t* entries, int* count)
     return true;
 }
 
-static bool validWorld(uintptr_t w)
+static bool validEntitiesModel(uintptr_t w)
 {
     uintptr_t d = 0, e = 0;
     int c = 0;
@@ -606,18 +609,30 @@ static bool validWorld(uintptr_t w)
     return false;
 }
 
-static uintptr_t resolveStatic(uintptr_t rva, bool (*validate)(uintptr_t))
+static bool validWorldModel(uintptr_t wm)
+{
+    uintptr_t w = 0;
+    if (!readPtr(wm + OFF_WM_WORLD, &w)) return false;
+    return validEntitiesModel(w);
+}
+
+// the slot may hold the instance itself, a static-fields block, or an Il2CppClass
+static uintptr_t staticInstance(uintptr_t rva, bool (*validate)(uintptr_t))
 {
     if (!g_gaBase || !rva) return 0;
     uintptr_t p = 0;
     if (!readPtr(g_gaBase + rva, &p)) return 0;
+
     if (validate(p)) return p;
-    const uintptr_t drifts[5] = { 0xB8, 0xB0, 0xC0, 0xA8, 0xC8 };
-    for (int i = 0; i < 5; ++i)
+
+    uintptr_t q = 0;
+    if (readPtr(p + 0x10, &q) && validate(q)) return q;
+
+    for (uintptr_t off = 0x80; off < 0x200; off += 8)
     {
-        uintptr_t q = 0;
-        if (!readPtr(p + drifts[i], &q)) continue;
-        if (validate(q)) return q;
+        uintptr_t sf = 0;
+        if (!readPtr(p + off, &sf)) continue;
+        if (readPtr(sf + 0x10, &q) && validate(q)) return q;
     }
     return 0;
 }
@@ -647,13 +662,21 @@ static void refreshStatics()
 
     if (!g_camModel || !validCameraModel(g_camModel))
     {
-        g_camModel = resolveStatic(RVA_CAMERA_STATIC, validCameraModel);
+        g_camModel = staticInstance(RVA_CAMERA_STATIC, validCameraModel);
         if (g_camModel) printf("[+] camera model %p\n", (void*)g_camModel);
     }
-    if (!g_world || !validWorld(g_world))
+
+    if (!g_worldModel || !validWorldModel(g_worldModel))
+        g_worldModel = staticInstance(RVA_WORLD_STATIC, validWorldModel);
+
+    if (g_worldModel)
     {
-        g_world = resolveStatic(RVA_WORLD_STATIC, validWorld);
-        if (g_world) printf("[+] world entities %p\n", (void*)g_world);
+        uintptr_t w = 0;
+        if (readPtr(g_worldModel + OFF_WM_WORLD, &w) && validEntitiesModel(w))
+        {
+            if (w != g_world) printf("[+] world entities %p (model %p)\n", (void*)w, (void*)g_worldModel);
+            g_world = w;
+        }
     }
 
     if (g_camModel)
@@ -666,7 +689,9 @@ static void refreshStatics()
             if (l > 0.9f && l < 1.1f)
             {
                 g_camPos = p;
-                g_camFwd.x = f.x / l; g_camFwd.y = f.y / l; g_camFwd.z = f.z / l;
+                g_camFwd.x = f.x / l;
+                g_camFwd.y = f.y / l;
+                g_camFwd.z = f.z / l;
                 g_camRight = r;
                 g_camUp = u;
                 g_camDist = read<float>(g_camModel + OFF_CAM_DIST);
@@ -1150,18 +1175,29 @@ static std::wstring keyName(int vk)
     return std::wstring(b);
 }
 
+struct FindCtx { DWORD pid; HWND best; long area; };
+
+static BOOL CALLBACK findGameProc(HWND h, LPARAM lp)
+{
+    FindCtx* c = (FindCtx*)lp;
+    DWORD p = 0;
+    GetWindowThreadProcessId(h, &p);
+    if (p != c->pid || !IsWindowVisible(h)) return TRUE;
+    RECT r = { 0 };
+    if (!GetClientRect(h, &r)) return TRUE;
+    long a = (r.right - r.left) * (r.bottom - r.top);
+    if (a > c->area) { c->area = a; c->best = h; }
+    return TRUE;
+}
+
 static HWND findGameWindow(DWORD pid)
 {
-    HWND best = nullptr;
-    long bestArea = 0;
-    DWORD target = pid;
-    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-        DWORD* t = (DWORD*)((BYTE*)lp);
-        return TRUE;
-    }, (LPARAM)&target);
-    (void)best;
-    (void)bestArea;
-    return best;
+    FindCtx c;
+    c.pid = pid;
+    c.best = nullptr;
+    c.area = 0;
+    EnumWindows(findGameProc, (LPARAM)&c);
+    return c.best;
 }
 
 // ------------------------------------------------------------------ overlay
@@ -1535,6 +1571,7 @@ static LRESULT CALLBACK GuiProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         case IDC_REATTACH:
             g_camModel = 0;
             g_world = 0;
+            g_worldModel = 0;
             g_updater = 0;
             g_lastStatic = 0;
             g_lastUpdScan = 0;
@@ -1717,8 +1754,8 @@ static void workerThread()
 
         wchar_t st[320] = { 0 };
         _snwprintf_s(st, _countof(st), _TRUNCATE,
-                     L"ga %p  cam %s  world %p\nupdater %p  ents %zu  esp %s  aim %s",
-                     (void*)g_gaBase, cam ? L"ok" : L"-", (void*)g_world,
+                     L"ga %p  cam %s  world %p/%p\nupdater %p  ents %zu  esp %s  aim %s",
+                     (void*)g_gaBase, cam ? L"ok" : L"-", (void*)g_world, (void*)g_worldModel,
                      (void*)g_updater, n, cfg.esp ? L"on" : L"off", aimActive() ? L"on" : L"off");
         setStatus(std::wstring(st));
 
@@ -1813,12 +1850,13 @@ int main(int argc, char** argv)
     }
 
     g_gameWnd = findGameWindow(pid);
+    if (g_gameWnd) printf("[+] game window %p\n", (void*)g_gameWnd);
 
     if (diagMode)
     {
         refreshStatics();
         printf("ga base %p size %zx\n", (void*)g_gaBase, g_gaSize);
-        printf("camera model %p  world %p\n", (void*)g_camModel, (void*)g_world);
+        printf("camera model %p  world %p  model %p\n", (void*)g_camModel, (void*)g_world, (void*)g_worldModel);
         system("pause");
         return 0;
     }
