@@ -1,5 +1,8 @@
 // instant_loot.cpp  —  build x64, run as admin
 #define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -97,7 +100,7 @@ static bool enableDebugPrivilege()
         return false;
 
     LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) { CloseHandle(tok); return false; }
+    if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) { CloseHandle(tok); return false; }
 
     TOKEN_PRIVILEGES tp{};
     tp.PrivilegeCount = 1;
