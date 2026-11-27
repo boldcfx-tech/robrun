@@ -1,4 +1,5 @@
 // instant_loot.cpp  —  build x64, run as admin
+#define NOMINMAX
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -144,7 +145,7 @@ static int scoreMatch(const std::wstring& exe, const std::wstring& title, const 
     if (exe == key || exe == key + L"exe") s = 100;   // "robrun" / "robrunexe"
     else if (exe.rfind(key, 0) == 0)       s = 60;    // exe starts with key
     else if (wcontains(exe, key))          s = 40;    // exe contains key
-    if (wcontains(title, key)) s = std::max(s, 5);    // title-only = weakest
+    if (wcontains(title, key)) s = (std::max)(s, 5);  // title-only = weakest
     return s;
 }
 
@@ -421,8 +422,7 @@ int main(int argc, char** argv)
     for (;;)
     {
         uintptr_t bu = findBattleUpdater(!reported);
-        if (bu) reported = true;
-        else    reported = false;
+        reported = (bu != 0);
         InstantLoot(bu);
         Sleep(WATCH_INTERVAL);
     }
