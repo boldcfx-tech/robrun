@@ -29,13 +29,11 @@ static const wchar_t* DEFAULT_KEYWORD = L"ROB RUN";
 
 #define USE_SIGNATURE   1
 
-// 64-bit: mov rax,[rip+disp32] ; mov rcx,[rax+disp32]
 static const char* BUPDATER_PATTERN_64 = "48 8B 05 ?? ?? ?? ?? 48 8B 88 ?? ?? ?? ??";
-static const int   BUPDATER_PATTERN_OFFSET_64 = 3;   // disp32 inside a 7-byte insn
+static const int   BUPDATER_PATTERN_OFFSET_64 = 3;
 
-// 32-bit: mov eax,[disp32] ; mov ecx,[eax+disp32]
 static const char* BUPDATER_PATTERN_32 = "8B 05 ?? ?? ?? ?? 8B 88 ?? ?? ?? ??";
-static const int   BUPDATER_PATTERN_OFFSET_32 = 2;   // disp32 inside a 6-byte insn
+static const int   BUPDATER_PATTERN_OFFSET_32 = 2;
 
 static const bool BUPDATER_PATTERN_DEREF = true;
 
@@ -48,17 +46,39 @@ static HANDLE    g_proc = nullptr;
 static uintptr_t g_base = 0;
 static size_t    g_size = 0;
 static wchar_t   g_procName[MAX_PATH] = L"";
-static size_t    g_ptrSize = 8;      // 4 for WOW64 targets, 8 for native x64
+static size_t    g_ptrSize = 8;
+static bool      g_haveQI = false;
+
+// ntdll equivalents that work without PROCESS_QUERY_INFORMATION
+typedef NTSTATUS (NTAPI* PFN_NtReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+typedef NTSTATUS (NTAPI* PFN_NtQueryVirtualMemory)(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
+static PFN_NtReadVirtualMemory  g_ntRead = nullptr;
+static PFN_NtQueryVirtualMemory g_ntQueryVm = nullptr;
+
+static void loadNt()
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (!nt) return;
+    g_ntRead    = reinterpret_cast<PFN_NtReadVirtualMemory>(GetProcAddress(nt, "NtReadVirtualMemory"));
+    g_ntQueryVm = reinterpret_cast<PFN_NtQueryVirtualMemory>(GetProcAddress(nt, "NtQueryVirtualMemory"));
+}
 
 // ------------------------------------------------------------------ memory
+static bool readRaw(uintptr_t addr, void* buf, size_t len)
+{
+    SIZE_T got = 0;
+    if (ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(addr), buf, len, &got) && got == len)
+        return true;
+    if (g_ntRead && g_ntRead(g_proc, reinterpret_cast<PVOID>(addr), buf, len, &got) >= 0 && got == len)
+        return true;
+    return false;
+}
+
 template <typename T>
 static T read(uintptr_t addr)
 {
     T out{};
-    SIZE_T got = 0;
-    if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(addr), &out, sizeof(T), &got)
-        || got != sizeof(T))
-        out = T{};
+    if (!readRaw(addr, &out, sizeof(T))) out = T{};
     return out;
 }
 
@@ -70,7 +90,6 @@ static bool write(uintptr_t addr, T value)
            && put == sizeof(T);
 }
 
-// Pointer-sized read. Returns false on a null or unreadable pointer.
 static bool readPtr(uintptr_t addr, uintptr_t* out)
 {
     if (g_ptrSize == 4)
@@ -82,6 +101,17 @@ static bool readPtr(uintptr_t addr, uintptr_t* out)
     const uint64_t v = read<uint64_t>(addr);
     *out = static_cast<uintptr_t>(v);
     return v != 0;
+}
+
+static bool queryRegion(uintptr_t addr, MEMORY_BASIC_INFORMATION* mbi)
+{
+    if (g_ntQueryVm)
+    {
+        SIZE_T got = 0;
+        if (g_ntQueryVm(g_proc, reinterpret_cast<PVOID>(addr), 0, mbi, sizeof(*mbi), &got) >= 0)
+            return true;
+    }
+    return VirtualQueryEx(g_proc, reinterpret_cast<LPCVOID>(addr), mbi, sizeof(*mbi)) == sizeof(*mbi);
 }
 
 // ------------------------------------------------------------------ elevation
@@ -207,7 +237,7 @@ static void printList()
     printf("---------------------------------------------------------------\n");
     for (auto& c : snapshotProcs(true))
         printf("%-8lu %-31ls %.60ls\n", c.pid, c.exe.c_str(), c.title.c_str());
-    printf("\nusage: instant_loot.exe <exe name | --pid N> [--watch]\n");
+    printf("\nusage: instant_loot.exe <exe name | --pid N> [--watch|--loot|--diag]\n");
 }
 
 static DWORD findPidExact(const wchar_t* name)
@@ -267,6 +297,29 @@ static bool exeNameForPid(DWORD pid)
     return false;
 }
 
+// ------------------------------------------------------------------ handle
+static bool openTarget(DWORD pid)
+{
+    struct { const char* label; DWORD rights; bool qi; } tries[] = {
+        { "rw+q", PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION, true },
+        { "rw+ql", PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_LIMITED_INFORMATION, false },
+        { "r+ql", PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, false },
+    };
+
+    for (auto& t : tries)
+    {
+        g_proc = OpenProcess(t.rights, FALSE, pid);
+        if (g_proc)
+        {
+            g_haveQI = t.qi;
+            printf("[+] handle 0x%08lX (%s)%s\n", t.rights, t.label, t.qi ? "" : " - no QUERY_INFORMATION");
+            return true;
+        }
+        printf("[!] OpenProcess(0x%08lX) failed (%lu)\n", t.rights, GetLastError());
+    }
+    return false;
+}
+
 // ------------------------------------------------------------------ bitness
 static void detectBitness()
 {
@@ -282,21 +335,16 @@ static void detectBitness()
 }
 
 // ------------------------------------------------------------------ module base
-// Accepts both x86 and x64 images; records the pointer size from the header.
 static bool validateImageBase(uintptr_t base, size_t* sizeOut)
 {
     if (!base) return false;
 
     IMAGE_DOS_HEADER dos{};
-    if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(base), &dos, sizeof(dos), nullptr))
-        return false;
+    if (!readRaw(base, &dos, sizeof(dos))) return false;
     if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) return false;
 
-    // The 32-bit header covers every field we need; the prefix is identical
-    // for both machines and SizeOfImage sits at the same offset.
     IMAGE_NT_HEADERS32 nt{};
-    if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(base + dos.e_lfanew), &nt, sizeof(nt), nullptr))
-        return false;
+    if (!readRaw(base + dos.e_lfanew, &nt, sizeof(nt))) return false;
     if (nt.Signature != IMAGE_NT_SIGNATURE) return false;
     if (!nt.OptionalHeader.SizeOfImage) return false;
 
@@ -358,8 +406,6 @@ static bool baseFromPsapi()
     return true;
 }
 
-// PEB walk. Uses ProcessWow64Information for 32-bit targets, since the native
-// PEB of a WOW64 process only lists the 64-bit modules.
 static bool baseFromPeb()
 {
     using NtQIP = NTSTATUS (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -373,7 +419,7 @@ static bool baseFromPeb()
     if (g_ptrSize == 4)
     {
         ULONG_PTR peb32 = 0;
-        if (ntqip(g_proc, 26 /* ProcessWow64Information */, &peb32, sizeof(peb32), nullptr) < 0) return false;
+        if (ntqip(g_proc, 26, &peb32, sizeof(peb32), nullptr) < 0) return false;
         if (!peb32) return false;
         peb = static_cast<uintptr_t>(peb32);
         ldrOff = 0x0C; listOff = 0x14; linksOff = 0x08;
@@ -382,7 +428,7 @@ static bool baseFromPeb()
     else
     {
         PROCESS_BASIC_INFORMATION pbi{};
-        if (ntqip(g_proc, 0 /* ProcessBasicInformation */, &pbi, sizeof(pbi), nullptr) < 0) return false;
+        if (ntqip(g_proc, 0, &pbi, sizeof(pbi), nullptr) < 0) return false;
         if (!pbi.PebBaseAddress) return false;
         peb = reinterpret_cast<uintptr_t>(pbi.PebBaseAddress);
         ldrOff = 0x18; listOff = 0x20; linksOff = 0x10;
@@ -408,7 +454,7 @@ static bool baseFromPeb()
             readPtr(entry + nameBufOff, &nameBuf) && nameBuf)
         {
             wchar_t name[256]{};
-            if (ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(nameBuf), name, nameLen, nullptr))
+            if (readRaw(nameBuf, name, nameLen))
             {
                 name[nameLen / sizeof(wchar_t)] = L'\0';
                 if (_wcsicmp(name, g_procName) == 0)
@@ -435,7 +481,7 @@ static bool baseFromImageScan()
     uintptr_t lowest = 0;
     size_t lowestSize = 0;
 
-    while (VirtualQueryEx(g_proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)))
+    while (queryRegion(addr, &mbi))
     {
         if (mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT && mbi.AllocationBase)
         {
@@ -460,10 +506,10 @@ static bool baseFromImageScan()
 
 static bool resolveModuleBase(DWORD pid)
 {
-    if (baseFromToolhelp(pid)) { printf("[+] base via toolhelp\n"); return true; }
-    if (baseFromPsapi())       { printf("[+] base via psapi\n");    return true; }
-    if (baseFromPeb())         { printf("[+] base via PEB walk\n"); return true; }
-    if (baseFromImageScan())   { printf("[+] base via image scan\n"); return true; }
+    if (g_haveQI && baseFromToolhelp(pid)) { printf("[+] base via toolhelp\n"); return true; }
+    if (g_haveQI && baseFromPsapi())       { printf("[+] base via psapi\n");    return true; }
+    if (baseFromPeb())                     { printf("[+] base via PEB walk\n"); return true; }
+    if (baseFromImageScan())               { printf("[+] base via image scan\n"); return true; }
     return false;
 }
 
@@ -495,15 +541,12 @@ static uintptr_t scanPattern(const std::vector<int>& pat)
     if (!g_base || !g_size) return 0;
 
     std::vector<uint8_t> buf(g_size);
-    SIZE_T got = 0;
-    if (!ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(g_base), buf.data(), g_size, &got)
-        || got == 0)
-        return 0;
+    if (!readRaw(g_base, buf.data(), g_size)) return 0;
 
     const size_t n = pat.size();
-    if (got < n) return 0;
+    if (g_size < n) return 0;
 
-    for (size_t i = 0; i + n <= got; ++i)
+    for (size_t i = 0; i + n <= g_size; ++i)
     {
         bool hit = true;
         for (size_t j = 0; j < n; ++j)
@@ -529,7 +572,6 @@ static uintptr_t findBattleUpdater(bool verbose)
 
     if (is32)
     {
-        // x86 encodes the operand as an absolute address, not RIP-relative.
         const uint32_t abs = read<uint32_t>(hit + BUPDATER_PATTERN_OFFSET_32);
         if (!abs) return 0;
         return BUPDATER_PATTERN_DEREF ? static_cast<uintptr_t>(read<uint32_t>(abs)) : abs;
@@ -550,7 +592,6 @@ static void InstantLoot(uintptr_t battleUpdater)
     if (!battleUpdater)
         return;
 
-    // BattleEntitiesUpdater -> BattleScreenContent -> InventoryRevealViewDescriptions
     uintptr_t content = 0;
     if (!readPtr(battleUpdater + 0x68, &content))
         return;
@@ -559,10 +600,8 @@ static void InstantLoot(uintptr_t battleUpdater)
     if (!readPtr(content + 0x540, &inst))
         return;
 
-    // Delay between cells on the main instance (TimeToOneCellBorder)
     write<float>(inst + 0x58, 0.0001f);
 
-    // List<Pair> at +0x18
     uintptr_t list = 0;
     if (!readPtr(inst + 0x18, &list))
         return;
@@ -575,7 +614,6 @@ static void InstantLoot(uintptr_t battleUpdater)
     if (size <= 0 || size > 500)
         return;
 
-    // Loop items (stride 0x18, Description* at +0x10)
     for (int i = 0; i < size; ++i)
     {
         const uintptr_t pair = items + 0x20 + (static_cast<uintptr_t>(i) * 0x18);
@@ -584,12 +622,160 @@ static void InstantLoot(uintptr_t battleUpdater)
         if (!readPtr(pair + 0x10, &desc))
             continue;
 
-        // Shine Duration (inline struct 0x18 + 0x28)
         write<float>(desc + 0x40, 0.0f);
-
-        // Icon Duration (inline struct 0x50 + 0x18)
         write<float>(desc + 0x68, 0.0f);
     }
+}
+
+// ------------------------------------------------------------------ loot dump
+// BattleEntitiesUpdater._battleEntitiesModel (0x18) -> _worldEntitiesModel (0x60)
+// -> list offset -> elements -> position model -> X/Y/Z
+static void dumpList(const char* label, uintptr_t world, uintptr_t listOff, uintptr_t posOff)
+{
+    uintptr_t list = 0;
+    if (!readPtr(world + listOff, &list))
+    {
+        printf("  %s: no list\n", label);
+        return;
+    }
+
+    uintptr_t items = 0;
+    if (!readPtr(list + 0x10, &items))
+    {
+        printf("  %s: empty\n", label);
+        return;
+    }
+
+    const int size = read<int>(list + 0x18);
+    if (size <= 0 || size > 4096)
+    {
+        printf("  %s: bad size %d\n", label, size);
+        return;
+    }
+
+    printf("  %s: %d entries\n", label, size);
+    for (int i = 0; i < size; ++i)
+    {
+        uintptr_t ent = 0;
+        if (!readPtr(items + 0x20 + (static_cast<uintptr_t>(i) * g_ptrSize), &ent))
+            continue;
+
+        uintptr_t pos = 0;
+        if (!readPtr(ent + posOff, &pos))
+            continue;
+
+        printf("    [%3d] %11.2f %11.2f %11.2f\n",
+               i, read<float>(pos + 0x10), read<float>(pos + 0x14), read<float>(pos + 0x18));
+    }
+}
+
+static void DumpLoot(uintptr_t battleUpdater)
+{
+    if (!battleUpdater)
+    {
+        printf("[!] no battleUpdater\n");
+        return;
+    }
+
+    uintptr_t entities = 0;
+    if (!readPtr(battleUpdater + 0x18, &entities))
+    {
+        printf("[!] no battleEntitiesModel\n");
+        return;
+    }
+
+    uintptr_t world = 0;
+    if (!readPtr(entities + 0x60, &world))
+    {
+        printf("[!] no worldEntitiesModel\n");
+        return;
+    }
+
+    dumpList("containers", world, 0x20, 0x28);
+    dumpList("loots",      world, 0x38, 0x28);
+    dumpList("vehicleLoot", world, 0x40, 0x28);
+    dumpList("doors",      world, 0x48, 0x38);
+}
+
+// ------------------------------------------------------------------ diag
+static void diag(DWORD pid)
+{
+    printf("=== diag pid %lu ===\n", pid);
+    printf("elevated: %d\n", isElevated() ? 1 : 0);
+    printf("SeDebugPrivilege: %d\n", enableDebugPrivilege() ? 1 : 0);
+
+    struct { const char* n; DWORD r; } rights[] = {
+        { "QUERY_INFORMATION",         PROCESS_QUERY_INFORMATION },
+        { "QUERY_LIMITED_INFORMATION", PROCESS_QUERY_LIMITED_INFORMATION },
+        { "VM_READ",                   PROCESS_VM_READ },
+        { "VM_WRITE|VM_OP",            PROCESS_VM_WRITE | PROCESS_VM_OPERATION },
+        { "VM_READ|QUERY_INFORMATION", PROCESS_VM_READ | PROCESS_QUERY_INFORMATION },
+    };
+    for (auto& r : rights)
+    {
+        SetLastError(0);
+        HANDLE h = OpenProcess(r.r, FALSE, pid);
+        printf("  %-28s %s (err %lu)\n", r.n, h ? "ok" : "FAIL", h ? 0UL : GetLastError());
+        if (h) CloseHandle(h);
+    }
+
+    g_proc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!g_proc) { printf("no usable handle\n"); return; }
+    loadNt();
+
+    printf("NtReadVirtualMemory: %s\n", g_ntRead ? "available" : "missing");
+    printf("NtQueryVirtualMemory: %s\n", g_ntQueryVm ? "available" : "missing");
+
+    SetLastError(0);
+    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    printf("  SNAPMODULE                   %s (err %lu)\n",
+           s == INVALID_HANDLE_VALUE ? "FAIL" : "ok", s == INVALID_HANDLE_VALUE ? GetLastError() : 0UL);
+    if (s != INVALID_HANDLE_VALUE) CloseHandle(s);
+
+    HMODULE m[8]{};
+    DWORD need = 0;
+    SetLastError(0);
+    BOOL ep = EnumProcessModulesEx(g_proc, m, sizeof(m), &need, LIST_MODULES_ALL);
+    printf("  EnumProcessModulesEx         %s (err %lu, need %lu)\n",
+           ep ? "ok" : "FAIL", ep ? 0UL : GetLastError(), need);
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    SetLastError(0);
+    BOOL vq = VirtualQueryEx(g_proc, reinterpret_cast<LPCVOID>(0), &mbi, sizeof(mbi));
+    printf("  VirtualQueryEx(0)            %s (err %lu)\n", vq ? "ok" : "FAIL", vq ? 0UL : GetLastError());
+    if (g_ntQueryVm)
+    {
+        SIZE_T got = 0;
+        const NTSTATUS st = g_ntQueryVm(g_proc, reinterpret_cast<PVOID>(0), 0, &mbi, sizeof(mbi), &got);
+        printf("  NtQueryVirtualMemory(0)      status 0x%08lX\n", static_cast<unsigned long>(st));
+    }
+
+    uintptr_t probe = 0;
+    bool found = false;
+    for (int i = 0; i < 5000; ++i)
+    {
+        if (!queryRegion(probe, &mbi)) break;
+        if (mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT && mbi.AllocationBase)
+        { probe = reinterpret_cast<uintptr_t>(mbi.AllocationBase); found = true; break; }
+        const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= probe) break;
+        probe = next;
+    }
+
+    if (found)
+    {
+        uint8_t buf[8]{};
+        SIZE_T got = 0;
+        SetLastError(0);
+        BOOL r = ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(probe), buf, sizeof(buf), &got);
+        printf("  ReadProcessMemory(%p)  %s (err %lu, got %zu)\n",
+               reinterpret_cast<void*>(probe), r ? "ok" : "FAIL", r ? 0UL : GetLastError(), got);
+        if (r) printf("  first bytes: %02X %02X %02X %02X\n", buf[0], buf[1], buf[2], buf[3]);
+    }
+    else printf("  no MEM_IMAGE region reachable\n");
+
+    CloseHandle(g_proc);
+    g_proc = nullptr;
 }
 
 // ------------------------------------------------------------------ main
@@ -606,13 +792,15 @@ int main(int argc, char** argv)
     if (!enableDebugPrivilege())
         printf("[!] SeDebugPrivilege not enabled (%lu)\n", GetLastError());
 
-    bool watch = false;
+    bool watch = false, loot = false, doDiag = false;
     wchar_t nameArg[MAX_PATH] = L"";
     DWORD pidArg = 0;
 
     for (int i = 1; i < argc; ++i)
     {
         if (!_stricmp(argv[i], "--watch")) { watch = true; continue; }
+        if (!_stricmp(argv[i], "--loot"))  { loot = true; continue; }
+        if (!_stricmp(argv[i], "--diag"))  { doDiag = true; continue; }
         if (!_stricmp(argv[i], "--list"))  { printList(); system("pause"); return 0; }
         if (!_stricmp(argv[i], "--pid") && i + 1 < argc)
         {
@@ -660,6 +848,13 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (doDiag)
+    {
+        diag(pid);
+        system("pause");
+        return 0;
+    }
+
     if (!g_procName[0] && !exeNameForPid(pid))
     {
         printf("[!] could not resolve exe name for pid %lu\n", pid);
@@ -667,18 +862,14 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    g_proc = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
-                         | PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!g_proc)
-        g_proc = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
-                             | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!g_proc)
+    if (!openTarget(pid))
     {
-        printf("[!] OpenProcess failed (%lu) - run as admin\n", GetLastError());
+        printf("[!] could not open pid %lu\n", pid);
         system("pause");
         return 1;
     }
 
+    loadNt();
     detectBitness();
 
     bool haveBase = false;
@@ -690,12 +881,19 @@ int main(int argc, char** argv)
     if (!haveBase)
     {
         printf("[!] all module base strategies failed\n");
-        printf("    note: error 87 here is the VirtualQueryEx loop exit, not the cause\n");
+        printf("    run: instant_loot.exe --pid %lu --diag\n", pid);
         system("pause");
         return 1;
     }
 
     printf("[+] base %p  size %zx  ptr %zu\n", (void*)g_base, g_size, g_ptrSize);
+
+    if (loot)
+    {
+        DumpLoot(findBattleUpdater(true));
+        system("pause");
+        return 0;
+    }
 
     if (!watch)
     {
