@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <vector>
 #include <string>
 
@@ -101,6 +102,19 @@ static std::vector<Cand> snapshotProcs()
     return out;
 }
 
+static bool wcontains(const wchar_t* hay, const wchar_t* needle)
+{
+    if (!*needle) return true;
+    for (const wchar_t* h = hay; *h; ++h)
+    {
+        const wchar_t* a = h;
+        const wchar_t* b = needle;
+        while (*a && *b && towlower(*a) == towlower(*b)) { ++a; ++b; }
+        if (!*b) return true;
+    }
+    return false;
+}
+
 static DWORD findPidExact(const wchar_t* name)
 {
     for (auto& c : snapshotProcs())
@@ -114,7 +128,7 @@ static DWORD findPidKeyword(const wchar_t* keyword)
     for (auto& c : snapshotProcs())
     {
         if (c.pid == GetCurrentProcessId()) continue;
-        if (StrStrIW(c.exe.c_str(), keyword)) hits.push_back(c);
+        if (wcontains(c.exe.c_str(), keyword)) hits.push_back(c);
     }
     if (hits.size() == 1) { wcscpy_s(g_procName, hits[0].exe.c_str()); return hits[0].pid; }
 
