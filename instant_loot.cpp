@@ -35,6 +35,7 @@
 // ------------------------------------------------------------------ config
 static const wchar_t* DEFAULT_KEYWORD = L"ROB RUN";
 static const wchar_t* GAME_ASSEMBLY   = L"GameAssembly.dll";
+static const DWORD    WATCH_INTERVAL  = 100;
 
 // verified against robrun_offsets.json / robrun_sdk_offsets.json
 enum : uintptr_t
@@ -117,6 +118,8 @@ static wchar_t   g_procName[MAX_PATH] = L"";
 static wchar_t   g_gameDir[MAX_PATH * 2] = L"";
 static bool      g_haveQI = false;
 static uintptr_t g_forcedBase = 0;
+
+static HWND      g_gameWnd = nullptr;
 
 static std::atomic<bool> g_running{ true };
 
@@ -944,7 +947,7 @@ static CRITICAL_SECTION g_logLock;
 static std::deque<std::wstring> g_logQ;
 static std::wstring g_status;
 
-static HWND g_gui = nullptr, g_overlay = nullptr, g_gameWnd = nullptr;
+static HWND g_gui = nullptr, g_overlay = nullptr;
 static HHOOK g_kbHook = nullptr, g_msHook = nullptr;
 static std::atomic<int>  g_capture{ 0 };
 static std::atomic<bool> g_hold{ false };
@@ -1011,7 +1014,7 @@ static void loadConfig()
     cfg.drawBox = iniGet(p, L"box", cfg.drawBox) != 0;
     cfg.drawDist = iniGet(p, L"dist", cfg.drawDist) != 0;
     cfg.drawHealth = iniGet(p, L"hp", cfg.drawHealth) != 0;
-    cfg.drawSnapline = iniGet(p, L"snap", cfg.drawSnapline) != 0;
+    cfg.drawSnapline = iniGet(p, L"snapline", cfg.drawSnapline) != 0;
     cfg.drawPlayers = iniGet(p, L"players", cfg.drawPlayers) != 0;
     cfg.drawContainers = iniGet(p, L"cont", cfg.drawContainers) != 0;
     cfg.drawLoot = iniGet(p, L"lootents", cfg.drawLoot) != 0;
@@ -1362,333 +1365,4 @@ static LRESULT CALLBACK GuiProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_HSCROLL:
     {
-        HWND s = reinterpret_cast<HWND>(lp);
-        const int id = GetDlgCtrlID(s);
-        const int p = (int)SendMessageW(s, TBM_GETPOS, 0, 0);
-        if (id == IDC_AFOV) cfg.aimFov = p;
-        if (id == IDC_SMOOTH) cfg.smooth = p;
-        if (id == IDC_EFOV) cfg.espFov = p;
-        if (id == IDC_MAXDIST) cfg.maxDist = p;
-        return 0;
-    }
-    case WM_COMMAND:
-    {
-        const int id = LOWORD(wp);
-        if (HIWORD(wp) != BN_CLICKED) return 0;
-        switch (id)
-        {
-        case IDC_ESP: cfg.esp = IsDlgButtonChecked(h, IDC_ESP) == BST_CHECKED; return 0;
-        case IDC_AIM: cfg.aim = IsDlgButtonChecked(h, IDC_AIM) == BST_CHECKED; return 0;
-        case IDC_LOOT: cfg.instantLoot = IsDlgButtonChecked(h, IDC_LOOT) == BST_CHECKED; return 0;
-        case IDC_BOX: cfg.drawBox = IsDlgButtonChecked(h, IDC_BOX) == BST_CHECKED; return 0;
-        case IDC_DIST: cfg.drawDist = IsDlgButtonChecked(h, IDC_DIST) == BST_CHECKED; return 0;
-        case IDC_HP: cfg.drawHealth = IsDlgButtonChecked(h, IDC_HP) == BST_CHECKED; return 0;
-        case IDC_SNAP: cfg.drawSnapline = IsDlgButtonChecked(h, IDC_SNAP) == BST_CHECKED; return 0;
-        case IDC_PLAYERS: cfg.drawPlayers = IsDlgButtonChecked(h, IDC_PLAYERS) == BST_CHECKED; return 0;
-        case IDC_CONTAINERS: cfg.drawContainers = IsDlgButtonChecked(h, IDC_CONTAINERS) == BST_CHECKED; return 0;
-        case IDC_LOOTENTS: cfg.drawLoot = IsDlgButtonChecked(h, IDC_LOOTENTS) == BST_CHECKED; return 0;
-        case IDC_DOORS: cfg.drawDoors = IsDlgButtonChecked(h, IDC_DOORS) == BST_CHECKED; return 0;
-        case IDC_TMODE: cfg.aimHoldMode = IsDlgButtonChecked(h, IDC_TMODE) == BST_CHECKED; return 0;
-        case IDC_KMENU: g_capture = 1; SetDlgItemTextW(h, IDC_KMENU, L"Menu key: ..."); return 0;
-        case IDC_KESP:  g_capture = 2; SetDlgItemTextW(h, IDC_KESP, L"ESP key: ..."); return 0;
-        case IDC_KAIM:  g_capture = 3; SetDlgItemTextW(h, IDC_KAIM, L"Aimbot key: ..."); return 0;
-        case IDC_KHOLD: g_capture = 4; SetDlgItemTextW(h, IDC_KHOLD, L"Aim hold key: ..."); return 0;
-        case IDC_SAVE: saveConfig(); logf(L"config saved"); return 0;
-        case IDC_REATTACH:
-            g_camModel = g_world = g_updater = 0;
-            g_lastStatic = 0; g_lastUpdScan = 0;
-            logf(L"re-resolving");
-            return 0;
-        }
-        return 0;
-    }
-    case WM_APP_CAPTURED:
-    {
-        const int vk = (int)wp;
-        const int which = g_capture.exchange(0);
-        if (vk == VK_ESCAPE) { syncControls(h); return 0; }
-        if (which == 1) cfg.menuKey = vk;
-        if (which == 2) cfg.espKey = vk;
-        if (which == 3) cfg.aimKey = vk;
-        if (which == 4) cfg.holdKey = vk;
-        logf(L"bind: %s", keyName(vk).c_str());
-        syncControls(h);
-        return 0;
-    }
-    case WM_APP_TOGGLE:
-        if (IsWindowVisible(h)) { if (GetForegroundWindow() == h) ShowWindow(h, SW_HIDE); else SetForegroundWindow(h); }
-        else { ShowWindow(h, SW_SHOW); SetForegroundWindow(h); }
-        return 0;
-    case WM_APP_ESP: cfg.esp = !cfg.esp; syncControls(h); return 0;
-    case WM_APP_AIM: cfg.aim = !cfg.aim; syncControls(h); return 0;
-
-    case WM_TIMER:
-    {
-        std::wstring st;
-        EnterCriticalSection(&g_snapLock);
-        st = g_status;
-        LeaveCriticalSection(&g_snapLock);
-        if (g_hStatus) SetWindowTextW(g_hStatus, st.c_str());
-
-        EnterCriticalSection(&g_logLock);
-        while (!g_logQ.empty())
-        {
-            std::wstring line = g_logQ.front();
-            g_logQ.pop_front();
-            LeaveCriticalSection(&g_logLock);
-            if (g_hLog)
-            {
-                const int i = (int)SendMessageW(g_hLog, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
-                SendMessageW(g_hLog, LB_SETTOPINDEX, (WPARAM)i, 0);
-            }
-            EnterCriticalSection(&g_logLock);
-        }
-        LeaveCriticalSection(&g_logLock);
-        return 0;
-    }
-    case WM_CLOSE: ShowWindow(h, SW_HIDE); return 0;
-    }
-    return DefWindowProcW(h, m, wp, lp);
-}
-
-static void createGui()
-{
-    WNDCLASSEXW wc{ sizeof(wc) };
-    wc.lpfnWndProc = GuiProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    wc.lpszClassName = L"ilGuiWnd";
-    RegisterClassExW(&wc);
-    g_gui = CreateWindowExW(WS_EX_TOPMOST, L"ilGuiWnd", L"instant loot",
-                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 400, 720,
-                            nullptr, nullptr, wc.hInstance, nullptr);
-    if (g_gui) SetTimer(g_gui, 2, 400, nullptr);
-}
-
-// ------------------------------------------------------------------ hooks
-static bool gameFocused()
-{
-    const HWND f = GetForegroundWindow();
-    if (!f) return false;
-    if (f == g_gameWnd) return true;
-    return g_gui && (f == g_gui || IsChild(g_gui, f));
-}
-
-static void captureKey(int vk)
-{
-    if (g_capture.load() && g_gui) PostMessageW(g_gui, WM_APP_CAPTURED, (WPARAM)vk, 0);
-}
-
-static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION)
-    {
-        const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
-        const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
-        const int vk = (int)k->vkCode;
-
-        if (g_capture.load()) { if (down) captureKey(vk); return 1; }
-
-        if (vk == cfg.holdKey) g_hold = down;
-
-        if (down && gameFocused())
-        {
-            if (vk == cfg.menuKey) { PostMessageW(g_gui, WM_APP_TOGGLE, 0, 0); return 1; }
-            if (vk == cfg.espKey)  { PostMessageW(g_gui, WM_APP_ESP, 0, 0); return 1; }
-            if (vk == cfg.aimKey)  { PostMessageW(g_gui, WM_APP_AIM, 0, 0); return 1; }
-        }
-    }
-    return CallNextHookEx(nullptr, code, wp, lp);
-}
-
-static LRESULT CALLBACK LLMouse(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION)
-    {
-        const auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
-        int vk = 0; bool down = false;
-        switch (wp)
-        {
-        case WM_LBUTTONDOWN: down = true; vk = VK_LBUTTON; break;
-        case WM_LBUTTONUP: vk = VK_LBUTTON; break;
-        case WM_RBUTTONDOWN: down = true; vk = VK_RBUTTON; break;
-        case WM_RBUTTONUP: vk = VK_RBUTTON; break;
-        case WM_MBUTTONDOWN: down = true; vk = VK_MBUTTON; break;
-        case WM_MBUTTONUP: vk = VK_MBUTTON; break;
-        case WM_XBUTTONDOWN: down = true; vk = (HIWORD(m->mouseData) == XBUTTON2) ? VK_XBUTTON2 : VK_XBUTTON1; break;
-        case WM_XBUTTONUP: vk = (HIWORD(m->mouseData) == XBUTTON2) ? VK_XBUTTON2 : VK_XBUTTON1; break;
-        }
-        if (!vk) return CallNextHookEx(nullptr, code, wp, lp);
-        if (g_capture.load()) { if (down) captureKey(vk); return CallNextHookEx(nullptr, code, wp, lp); }
-        if (vk == cfg.holdKey) g_hold = down;
-        if (down && gameFocused() && vk == cfg.aimKey) PostMessageW(g_gui, WM_APP_AIM, 0, 0);
-    }
-    return CallNextHookEx(nullptr, code, wp, lp);
-}
-
-// ------------------------------------------------------------------ worker
-static void workerThread()
-{
-    int misses = 0;
-    while (g_running.load())
-    {
-        if (!g_proc) { Sleep(200); continue; }
-
-        refreshStatics();
-
-        if (cfg.instantLoot)
-        {
-            const uintptr_t bu = ensureUpdater();
-            if (bu) instantLoot(bu);
-        }
-
-        if ((cfg.esp || aimActive()) && g_world && g_camOk) snapshotEntities();
-        else
-        {
-            EnterCriticalSection(&g_snapLock);
-            g_snap.clear();
-            LeaveCriticalSection(&g_snapLock);
-        }
-
-        if (aimActive()) doAim();
-
-        EnterCriticalSection(&g_snapLock);
-        const size_t n = g_snap.size();
-        const bool cam = g_camOk;
-        LeaveCriticalSection(&g_snapLock);
-
-        if (!g_world && ++misses > 12) { logf(L"world entities unresolved"); misses = 0; }
-
-        wchar_t st[320]{};
-        _snwprintf_s(st, _countof(st), _TRUNCATE,
-                     L"ga %p  cam %s  world %p\nupdater %p  ents %zu  esp %s  aim %s",
-                     (void*)g_gaBase, cam ? L"ok" : L"-", (void*)g_world,
-                     (void*)g_updater, n, cfg.esp ? L"on" : L"off", aimActive() ? L"on" : L"off");
-        setStatus(st);
-
-        Sleep(cfg.esp || cfg.aim ? 12 : 60);
-    }
-}
-
-// ------------------------------------------------------------------ main
-int main(int argc, char** argv)
-{
-    SetConsoleTitleW(L"instant loot");
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    InitializeCriticalSection(&g_snapLock);
-    InitializeCriticalSection(&g_logLock);
-
-    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
-    InitCommonControlsEx(&icc);
-
-    loadConfig();
-
-    if (!isElevated())
-    {
-        printf("[!] not elevated - requesting UAC\n");
-        if (relaunchElevated()) return 0;
-    }
-    enableDebugPrivilege();
-
-    bool watch = false, loot = false, diagMode = false, guiMode = true;
-    wchar_t nameArg[MAX_PATH] = L"";
-    DWORD pidArg = 0;
-
-    for (int i = 1; i < argc; ++i)
-    {
-        if (!_stricmp(argv[i], "--watch")) { watch = true; guiMode = false; continue; }
-        if (!_stricmp(argv[i], "--loot")) { loot = true; guiMode = false; continue; }
-        if (!_stricmp(argv[i], "--diag")) { diagMode = true; guiMode = false; continue; }
-        if (!_stricmp(argv[i], "--gui")) { guiMode = true; continue; }
-        if (!_stricmp(argv[i], "--list")) { printList(); system("pause"); return 0; }
-        if (!_stricmp(argv[i], "--pid") && i + 1 < argc) { pidArg = (DWORD)strtoul(argv[++i], nullptr, 10); continue; }
-        if (!_stricmp(argv[i], "--base") && i + 1 < argc) { g_forcedBase = (uintptr_t)_strtoui64(argv[++i], nullptr, 16); continue; }
-        MultiByteToWideChar(CP_ACP, 0, argv[i], -1, nameArg, MAX_PATH);
-    }
-
-    DWORD pid = 0;
-    if (pidArg) { if (!exeNameForPid(pidArg)) { printf("[!] pid %lu not found\n", pidArg); system("pause"); return 1; } pid = pidArg; }
-    else if (nameArg[0]) { pid = findPidExact(nameArg); if (pid) wcscpy_s(g_procName, nameArg); else pid = findPidKeyword(nameArg); }
-    else pid = findPidKeyword(DEFAULT_KEYWORD);
-
-    if (!pid) { printf("[!] target not found\n\n"); printList(); system("pause"); return 1; }
-    if (!g_procName[0] && !exeNameForPid(pid)) { printf("[!] no exe name\n"); system("pause"); return 1; }
-    if (!openTarget(pid)) { printf("[!] cannot open pid %lu\n", pid); system("pause"); return 1; }
-
-    loadNt();
-
-    // exe base (diag) + game dir
-    {
-        wchar_t path[MAX_PATH * 2]{};
-        DWORD len = _countof(path);
-        if (QueryFullProcessImageNameW(g_proc, 0, path, &len))
-        {
-            printf("[+] image path: %ls\n", path);
-            wcscpy_s(g_gameDir, path);
-            wchar_t* s = wcsrchr(g_gameDir, L'\\');
-            if (s) *(s + 1) = 0;
-        }
-        uintptr_t b = 0; size_t sz = 0;
-        if (findModule(pid, g_procName, &b, &sz)) { g_base = b; g_size = sz; }
-    }
-
-    g_gameWnd = findGameWindow(pid);
-
-    if (diagMode)
-    {
-        refreshStatics();
-        printf("ga base %p size %zx\n", (void*)g_gaBase, g_gaSize);
-        printf("camera model %p  world %p\n", (void*)g_camModel, (void*)g_world);
-        system("pause");
-        return 0;
-    }
-
-    if (loot)
-    {
-        refreshStatics();
-        const uintptr_t bu = ensureUpdater();
-        printf("[+] updater %p\n", (void*)bu);
-        instantLoot(bu);
-        system("pause");
-        return 0;
-    }
-
-    if (!guiMode)
-    {
-        refreshStatics();
-        printf("[+] watch mode\n");
-        for (;;)
-        {
-            refreshStatics();
-            const uintptr_t bu = ensureUpdater();
-            if (bu) instantLoot(bu);
-            Sleep(WATCH_INTERVAL);
-        }
-    }
-
-    if (!g_gameWnd) printf("[!] no game window found\n");
-
-    createOverlay();
-    createGui();
-    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LLKeyboard, GetModuleHandleW(nullptr), 0);
-    g_msHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouse, GetModuleHandleW(nullptr), 0);
-
-    std::thread worker(workerThread);
-
-    logf(L"attached to pid %lu", pid);
-    logf(L"%s opens this menu", keyName(cfg.menuKey).c_str());
-    logf(L"if ESP is empty: toggle ESP, check status line");
-
-    MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-
-    g_running = false;
-    worker.detach();
-    if (g_kbHook) UnhookWindowsHookEx(g_kbHook);
-    if (g_msHook) UnhookWindowsHookEx(g_msHook);
-    if (g_proc) CloseHandle(g_proc);
-    saveConfig();
-    return 0;
-}
+        HWND s = reinterpret
