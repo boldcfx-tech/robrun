@@ -48,8 +48,18 @@ static size_t    g_size = 0;
 static wchar_t   g_procName[MAX_PATH] = L"";
 static size_t    g_ptrSize = 8;
 static bool      g_haveQI = false;
+static uintptr_t g_forcedBase = 0;
 
-// ntdll equivalents that work without PROCESS_QUERY_INFORMATION
+struct FilePeInfo
+{
+    bool      ok = false;
+    size_t    sizeOfImage = 0;
+    uintptr_t imageBase = 0;
+    WORD      machine = 0;
+    wchar_t   path[MAX_PATH * 2]{};
+};
+static FilePeInfo g_file;
+
 typedef NTSTATUS (NTAPI* PFN_NtReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 typedef NTSTATUS (NTAPI* PFN_NtQueryVirtualMemory)(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
 static PFN_NtReadVirtualMemory  g_ntRead = nullptr;
@@ -69,6 +79,7 @@ static bool readRaw(uintptr_t addr, void* buf, size_t len)
     SIZE_T got = 0;
     if (ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(addr), buf, len, &got) && got == len)
         return true;
+    got = 0;
     if (g_ntRead && g_ntRead(g_proc, reinterpret_cast<PVOID>(addr), buf, len, &got) >= 0 && got == len)
         return true;
     return false;
@@ -320,98 +331,122 @@ static bool openTarget(DWORD pid)
     return false;
 }
 
-// ------------------------------------------------------------------ bitness
-static void detectBitness()
+// ------------------------------------------------------------------ file PE info
+static void readFilePeInfo()
 {
-    BOOL wow = FALSE;
-    if (IsWow64Process(g_proc, &wow) && wow)
+    g_file = FilePeInfo{};
+
+    DWORD len = static_cast<DWORD>(_countof(g_file.path));
+    if (!QueryFullProcessImageNameW(g_proc, 0, g_file.path, &len))
     {
-        g_ptrSize = 4;
-        printf("[+] target is 32-bit (WOW64)\n");
+        printf("[!] QueryFullProcessImageName failed (%lu)\n", GetLastError());
         return;
     }
-    g_ptrSize = 8;
-    printf("[+] target is 64-bit\n");
-}
+    printf("[+] image path: %ls\n", g_file.path);
 
-// ------------------------------------------------------------------ module base
-static bool validateImageBase(uintptr_t base, size_t* sizeOut)
-{
-    if (!base) return false;
+    HANDLE f = CreateFileW(g_file.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+    {
+        printf("[!] cannot open image on disk (%lu)\n", GetLastError());
+        return;
+    }
 
     IMAGE_DOS_HEADER dos{};
-    if (!readRaw(base, &dos, sizeof(dos))) return false;
-    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) return false;
-
-    IMAGE_NT_HEADERS32 nt{};
-    if (!readRaw(base + dos.e_lfanew, &nt, sizeof(nt))) return false;
-    if (nt.Signature != IMAGE_NT_SIGNATURE) return false;
-    if (!nt.OptionalHeader.SizeOfImage) return false;
-
-    const WORD machine = nt.FileHeader.Machine;
-    if (machine == IMAGE_FILE_MACHINE_I386)        g_ptrSize = 4;
-    else if (machine == IMAGE_FILE_MACHINE_AMD64)  g_ptrSize = 8;
-    else if (machine == IMAGE_FILE_MACHINE_ARM64)  g_ptrSize = 8;
-    else return false;
-
-    if (sizeOut) *sizeOut = nt.OptionalHeader.SizeOfImage;
-    return true;
-}
-
-static bool baseFromToolhelp(DWORD pid)
-{
-    for (int attempt = 0; attempt < 3; ++attempt)
+    DWORD got = 0;
+    if (ReadFile(f, &dos, sizeof(dos), &got, nullptr) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        SetFilePointer(f, dos.e_lfanew, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER)
     {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        if (snap != INVALID_HANDLE_VALUE)
+        IMAGE_NT_HEADERS64 nt{};
+        if (ReadFile(f, &nt, sizeof(nt), &got, nullptr) && nt.Signature == IMAGE_NT_SIGNATURE)
         {
-            MODULEENTRY32W me{ sizeof(me) };
-            bool found = false;
-            for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
-            {
-                if (_wcsicmp(me.szModule, g_procName) == 0)
-                {
-                    size_t size = 0;
-                    if (validateImageBase(reinterpret_cast<uintptr_t>(me.modBaseAddr), &size))
-                    {
-                        g_base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
-                        g_size = size;
-                        found  = true;
-                        break;
-                    }
-                }
-            }
-            CloseHandle(snap);
-            if (found) return true;
+            g_file.ok          = true;
+            g_file.machine     = nt.FileHeader.Machine;
+            g_file.imageBase   = static_cast<uintptr_t>(nt.OptionalHeader.ImageBase);
+            g_file.sizeOfImage = nt.OptionalHeader.SizeOfImage;
         }
-        Sleep(20);
     }
-    return false;
+    CloseHandle(f);
+
+    if (!g_file.ok) { printf("[!] could not parse image headers from disk\n"); return; }
+
+    printf("[+] image base 0x%llX  size 0x%zX  machine 0x%04X\n",
+           static_cast<unsigned long long>(g_file.imageBase), g_file.sizeOfImage, g_file.machine);
+
+    if (g_file.machine == IMAGE_FILE_MACHINE_I386)       g_ptrSize = 4;
+    else if (g_file.machine == IMAGE_FILE_MACHINE_AMD64) g_ptrSize = 8;
+    else if (g_file.machine == IMAGE_FILE_MACHINE_ARM64) g_ptrSize = 8;
 }
 
-static bool baseFromPsapi()
+// ------------------------------------------------------------------ base selection
+static bool plausibleBase(uintptr_t base)
+{
+    return base != 0 && (base & 0xFFF) == 0 && base < 0x00007FFFFFFF0000ULL;
+}
+
+static bool moduleNameAt(uintptr_t addr)
+{
+    wchar_t path[MAX_PATH * 2]{};
+    if (!GetMappedFileNameW(g_proc, reinterpret_cast<LPVOID>(addr), path, _countof(path)))
+        return false;
+    const wchar_t* tail = wcsrchr(path, L'\\');
+    tail = tail ? tail + 1 : path;
+    return _wcsicmp(tail, g_procName) == 0;
+}
+
+// Headers may be erased in memory; a base only has to be structurally sane.
+static bool probeHeader(uintptr_t base)
+{
+    IMAGE_DOS_HEADER dos{};
+    if (!readRaw(base, &dos, sizeof(dos))) return false;
+    return dos.e_magic == IMAGE_DOS_SIGNATURE;
+}
+
+static bool baseFromToolhelp(DWORD pid, DWORD* err)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) { *err = GetLastError(); return false; }
+
+    MODULEENTRY32W me{ sizeof(me) };
+    bool found = false;
+    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+    {
+        if (_wcsicmp(me.szModule, g_procName) != 0) continue;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
+        if (!plausibleBase(base)) continue;
+        g_base = base;
+        if (!g_size) g_size = me.modBaseSize;
+        found = true;
+        break;
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+static bool baseFromPsapi(DWORD* err)
 {
     HMODULE mods[512]{};
     DWORD needed = 0;
     if (!EnumProcessModulesEx(g_proc, mods, sizeof(mods), &needed, LIST_MODULES_ALL))
+    {
+        *err = GetLastError();
         return false;
-    if (needed < sizeof(HMODULE) || !mods[0]) return false;
+    }
+    if (needed < sizeof(HMODULE) || !mods[0]) { *err = ERROR_NOT_FOUND; return false; }
 
-    size_t size = 0;
-    uintptr_t base = reinterpret_cast<uintptr_t>(mods[0]);
-    if (!validateImageBase(base, &size)) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mods[0]);
+    if (!plausibleBase(base)) { *err = ERROR_BAD_FORMAT; return false; }
 
     g_base = base;
-    g_size = size;
     return true;
 }
 
-static bool baseFromPeb()
+static bool baseFromPeb(DWORD* err)
 {
     using NtQIP = NTSTATUS (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     auto ntqip = reinterpret_cast<NtQIP>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
-    if (!ntqip) return false;
+    if (!ntqip) { *err = ERROR_PROC_NOT_FOUND; return false; }
 
     uintptr_t peb = 0;
     uintptr_t ldrOff, listOff, linksOff, dllBaseOff, nameLenOff, nameBufOff;
@@ -419,8 +454,8 @@ static bool baseFromPeb()
     if (g_ptrSize == 4)
     {
         ULONG_PTR peb32 = 0;
-        if (ntqip(g_proc, 26, &peb32, sizeof(peb32), nullptr) < 0) return false;
-        if (!peb32) return false;
+        if (ntqip(g_proc, 26, &peb32, sizeof(peb32), nullptr) < 0) { *err = ERROR_BAD_FORMAT; return false; }
+        if (!peb32) { *err = ERROR_BAD_FORMAT; return false; }
         peb = static_cast<uintptr_t>(peb32);
         ldrOff = 0x0C; listOff = 0x14; linksOff = 0x08;
         dllBaseOff = 0x18; nameLenOff = 0x2C; nameBufOff = 0x30;
@@ -428,19 +463,19 @@ static bool baseFromPeb()
     else
     {
         PROCESS_BASIC_INFORMATION pbi{};
-        if (ntqip(g_proc, 0, &pbi, sizeof(pbi), nullptr) < 0) return false;
-        if (!pbi.PebBaseAddress) return false;
+        if (ntqip(g_proc, 0, &pbi, sizeof(pbi), nullptr) < 0) { *err = ERROR_BAD_FORMAT; return false; }
+        if (!pbi.PebBaseAddress) { *err = ERROR_BAD_FORMAT; return false; }
         peb = reinterpret_cast<uintptr_t>(pbi.PebBaseAddress);
         ldrOff = 0x18; listOff = 0x20; linksOff = 0x10;
         dllBaseOff = 0x30; nameLenOff = 0x58; nameBufOff = 0x60;
     }
 
     uintptr_t ldr = 0;
-    if (!readPtr(peb + ldrOff, &ldr)) return false;
+    if (!readPtr(peb + ldrOff, &ldr)) { *err = ERROR_PARTIAL_COPY; return false; }
 
     const uintptr_t head = ldr + listOff;
     uintptr_t cur = 0;
-    if (!readPtr(head, &cur)) return false;
+    if (!readPtr(head, &cur)) { *err = ERROR_PARTIAL_COPY; return false; }
 
     for (int i = 0; i < 512 && cur && cur != head; ++i)
     {
@@ -457,40 +492,36 @@ static bool baseFromPeb()
             if (readRaw(nameBuf, name, nameLen))
             {
                 name[nameLen / sizeof(wchar_t)] = L'\0';
-                if (_wcsicmp(name, g_procName) == 0)
+                if (_wcsicmp(name, g_procName) == 0 && plausibleBase(dllBase))
                 {
-                    size_t size = 0;
-                    if (validateImageBase(dllBase, &size))
-                    {
-                        g_base = dllBase;
-                        g_size = size;
-                        return true;
-                    }
+                    g_base = dllBase;
+                    return true;
                 }
             }
         }
         readPtr(cur, &cur);
     }
+
+    *err = ERROR_NOT_FOUND;
     return false;
 }
 
-static bool baseFromImageScan()
+static bool baseFromImageScan(DWORD* err)
 {
     MEMORY_BASIC_INFORMATION mbi{};
     uintptr_t addr = 0;
+    uintptr_t byName = 0;
     uintptr_t lowest = 0;
-    size_t lowestSize = 0;
 
     while (queryRegion(addr, &mbi))
     {
         if (mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT && mbi.AllocationBase)
         {
             const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
-            size_t size = 0;
-            if (validateImageBase(base, &size) && (lowest == 0 || base < lowest))
+            if (plausibleBase(base))
             {
-                lowest = base;
-                lowestSize = size;
+                if (!byName && moduleNameAt(base)) byName = base;
+                if (!lowest || base < lowest) lowest = base;
             }
         }
         const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -498,18 +529,39 @@ static bool baseFromImageScan()
         addr = next;
     }
 
-    if (!lowest) return false;
-    g_base = lowest;
-    g_size = lowestSize;
-    return true;
+    if (byName) { g_base = byName; return true; }
+    if (lowest) { g_base = lowest; return true; }
+
+    *err = ERROR_NOT_FOUND;
+    return false;
 }
 
 static bool resolveModuleBase(DWORD pid)
 {
-    if (g_haveQI && baseFromToolhelp(pid)) { printf("[+] base via toolhelp\n"); return true; }
-    if (g_haveQI && baseFromPsapi())       { printf("[+] base via psapi\n");    return true; }
-    if (baseFromPeb())                     { printf("[+] base via PEB walk\n"); return true; }
-    if (baseFromImageScan())               { printf("[+] base via image scan\n"); return true; }
+    if (g_forcedBase)
+    {
+        g_base = g_forcedBase;
+        printf("[+] base forced to %p\n", (void*)g_base);
+        return true;
+    }
+
+    DWORD err = 0;
+
+    if (g_haveQI && baseFromToolhelp(pid, &err)) { printf("[+] base via toolhelp\n"); return true; }
+    printf("[.] toolhelp failed (err %lu)\n", err);
+
+    err = 0;
+    if (g_haveQI && baseFromPsapi(&err)) { printf("[+] base via psapi\n"); return true; }
+    printf("[.] psapi failed (err %lu)\n", err);
+
+    err = 0;
+    if (baseFromPeb(&err)) { printf("[+] base via PEB walk\n"); return true; }
+    printf("[.] peb walk failed (err %lu)\n", err);
+
+    err = 0;
+    if (baseFromImageScan(&err)) { printf("[+] base via image scan\n"); return true; }
+    printf("[.] image scan failed (err %lu)\n", err);
+
     return false;
 }
 
@@ -589,80 +641,55 @@ static uintptr_t findBattleUpdater(bool verbose)
 // ------------------------------------------------------------------ patch
 static void InstantLoot(uintptr_t battleUpdater)
 {
-    if (!battleUpdater)
-        return;
+    if (!battleUpdater) return;
 
     uintptr_t content = 0;
-    if (!readPtr(battleUpdater + 0x68, &content))
-        return;
+    if (!readPtr(battleUpdater + 0x68, &content)) return;
 
     uintptr_t inst = 0;
-    if (!readPtr(content + 0x540, &inst))
-        return;
+    if (!readPtr(content + 0x540, &inst)) return;
 
     write<float>(inst + 0x58, 0.0001f);
 
     uintptr_t list = 0;
-    if (!readPtr(inst + 0x18, &list))
-        return;
+    if (!readPtr(inst + 0x18, &list)) return;
 
     uintptr_t items = 0;
-    if (!readPtr(list + 0x10, &items))
-        return;
+    if (!readPtr(list + 0x10, &items)) return;
 
     const int size = read<int>(list + 0x18);
-    if (size <= 0 || size > 500)
-        return;
+    if (size <= 0 || size > 500) return;
 
     for (int i = 0; i < size; ++i)
     {
         const uintptr_t pair = items + 0x20 + (static_cast<uintptr_t>(i) * 0x18);
-
         uintptr_t desc = 0;
-        if (!readPtr(pair + 0x10, &desc))
-            continue;
-
+        if (!readPtr(pair + 0x10, &desc)) continue;
         write<float>(desc + 0x40, 0.0f);
         write<float>(desc + 0x68, 0.0f);
     }
 }
 
 // ------------------------------------------------------------------ loot dump
-// BattleEntitiesUpdater._battleEntitiesModel (0x18) -> _worldEntitiesModel (0x60)
-// -> list offset -> elements -> position model -> X/Y/Z
 static void dumpList(const char* label, uintptr_t world, uintptr_t listOff, uintptr_t posOff)
 {
     uintptr_t list = 0;
-    if (!readPtr(world + listOff, &list))
-    {
-        printf("  %s: no list\n", label);
-        return;
-    }
+    if (!readPtr(world + listOff, &list)) { printf("  %s: no list\n", label); return; }
 
     uintptr_t items = 0;
-    if (!readPtr(list + 0x10, &items))
-    {
-        printf("  %s: empty\n", label);
-        return;
-    }
+    if (!readPtr(list + 0x10, &items)) { printf("  %s: empty\n", label); return; }
 
     const int size = read<int>(list + 0x18);
-    if (size <= 0 || size > 4096)
-    {
-        printf("  %s: bad size %d\n", label, size);
-        return;
-    }
+    if (size <= 0 || size > 4096) { printf("  %s: bad size %d\n", label, size); return; }
 
     printf("  %s: %d entries\n", label, size);
     for (int i = 0; i < size; ++i)
     {
         uintptr_t ent = 0;
-        if (!readPtr(items + 0x20 + (static_cast<uintptr_t>(i) * g_ptrSize), &ent))
-            continue;
+        if (!readPtr(items + 0x20 + (static_cast<uintptr_t>(i) * g_ptrSize), &ent)) continue;
 
         uintptr_t pos = 0;
-        if (!readPtr(ent + posOff, &pos))
-            continue;
+        if (!readPtr(ent + posOff, &pos)) continue;
 
         printf("    [%3d] %11.2f %11.2f %11.2f\n",
                i, read<float>(pos + 0x10), read<float>(pos + 0x14), read<float>(pos + 0x18));
@@ -671,30 +698,18 @@ static void dumpList(const char* label, uintptr_t world, uintptr_t listOff, uint
 
 static void DumpLoot(uintptr_t battleUpdater)
 {
-    if (!battleUpdater)
-    {
-        printf("[!] no battleUpdater\n");
-        return;
-    }
+    if (!battleUpdater) { printf("[!] no battleUpdater\n"); return; }
 
     uintptr_t entities = 0;
-    if (!readPtr(battleUpdater + 0x18, &entities))
-    {
-        printf("[!] no battleEntitiesModel\n");
-        return;
-    }
+    if (!readPtr(battleUpdater + 0x18, &entities)) { printf("[!] no battleEntitiesModel\n"); return; }
 
     uintptr_t world = 0;
-    if (!readPtr(entities + 0x60, &world))
-    {
-        printf("[!] no worldEntitiesModel\n");
-        return;
-    }
+    if (!readPtr(entities + 0x60, &world)) { printf("[!] no worldEntitiesModel\n"); return; }
 
-    dumpList("containers", world, 0x20, 0x28);
-    dumpList("loots",      world, 0x38, 0x28);
+    dumpList("containers",  world, 0x20, 0x28);
+    dumpList("loots",       world, 0x38, 0x28);
     dumpList("vehicleLoot", world, 0x40, 0x28);
-    dumpList("doors",      world, 0x48, 0x38);
+    dumpList("doors",       world, 0x48, 0x38);
 }
 
 // ------------------------------------------------------------------ diag
@@ -704,75 +719,20 @@ static void diag(DWORD pid)
     printf("elevated: %d\n", isElevated() ? 1 : 0);
     printf("SeDebugPrivilege: %d\n", enableDebugPrivilege() ? 1 : 0);
 
-    struct { const char* n; DWORD r; } rights[] = {
-        { "QUERY_INFORMATION",         PROCESS_QUERY_INFORMATION },
-        { "QUERY_LIMITED_INFORMATION", PROCESS_QUERY_LIMITED_INFORMATION },
-        { "VM_READ",                   PROCESS_VM_READ },
-        { "VM_WRITE|VM_OP",            PROCESS_VM_WRITE | PROCESS_VM_OPERATION },
-        { "VM_READ|QUERY_INFORMATION", PROCESS_VM_READ | PROCESS_QUERY_INFORMATION },
-    };
-    for (auto& r : rights)
-    {
-        SetLastError(0);
-        HANDLE h = OpenProcess(r.r, FALSE, pid);
-        printf("  %-28s %s (err %lu)\n", r.n, h ? "ok" : "FAIL", h ? 0UL : GetLastError());
-        if (h) CloseHandle(h);
-    }
-
-    g_proc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!g_proc) { printf("no usable handle\n"); return; }
+    if (!openTarget(pid)) { printf("no handle\n"); return; }
     loadNt();
 
-    printf("NtReadVirtualMemory: %s\n", g_ntRead ? "available" : "missing");
-    printf("NtQueryVirtualMemory: %s\n", g_ntQueryVm ? "available" : "missing");
+    if (g_file.ok) printf("image: %ls base 0x%llX size 0x%zX\n",
+                          g_file.path, static_cast<unsigned long long>(g_file.imageBase), g_file.sizeOfImage);
 
-    SetLastError(0);
-    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    printf("  SNAPMODULE                   %s (err %lu)\n",
-           s == INVALID_HANDLE_VALUE ? "FAIL" : "ok", s == INVALID_HANDLE_VALUE ? GetLastError() : 0UL);
-    if (s != INVALID_HANDLE_VALUE) CloseHandle(s);
-
-    HMODULE m[8]{};
-    DWORD need = 0;
-    SetLastError(0);
-    BOOL ep = EnumProcessModulesEx(g_proc, m, sizeof(m), &need, LIST_MODULES_ALL);
-    printf("  EnumProcessModulesEx         %s (err %lu, need %lu)\n",
-           ep ? "ok" : "FAIL", ep ? 0UL : GetLastError(), need);
-
-    MEMORY_BASIC_INFORMATION mbi{};
-    SetLastError(0);
-    BOOL vq = VirtualQueryEx(g_proc, reinterpret_cast<LPCVOID>(0), &mbi, sizeof(mbi));
-    printf("  VirtualQueryEx(0)            %s (err %lu)\n", vq ? "ok" : "FAIL", vq ? 0UL : GetLastError());
-    if (g_ntQueryVm)
+    if (plausibleBase(g_base))
     {
-        SIZE_T got = 0;
-        const NTSTATUS st = g_ntQueryVm(g_proc, reinterpret_cast<PVOID>(0), 0, &mbi, sizeof(mbi), &got);
-        printf("  NtQueryVirtualMemory(0)      status 0x%08lX\n", static_cast<unsigned long>(st));
+        uint8_t mz[2]{};
+        const bool headerOk = readRaw(g_base, mz, sizeof(mz)) && mz[0] == 'M' && mz[1] == 'Z';
+        printf("base 0x%llX: header %s\n", static_cast<unsigned long long>(g_base),
+               headerOk ? "intact" : "ERASED");
+        printf("module name at base: %d\n", moduleNameAt(g_base) ? 1 : 0);
     }
-
-    uintptr_t probe = 0;
-    bool found = false;
-    for (int i = 0; i < 5000; ++i)
-    {
-        if (!queryRegion(probe, &mbi)) break;
-        if (mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT && mbi.AllocationBase)
-        { probe = reinterpret_cast<uintptr_t>(mbi.AllocationBase); found = true; break; }
-        const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next <= probe) break;
-        probe = next;
-    }
-
-    if (found)
-    {
-        uint8_t buf[8]{};
-        SIZE_T got = 0;
-        SetLastError(0);
-        BOOL r = ReadProcessMemory(g_proc, reinterpret_cast<LPCVOID>(probe), buf, sizeof(buf), &got);
-        printf("  ReadProcessMemory(%p)  %s (err %lu, got %zu)\n",
-               reinterpret_cast<void*>(probe), r ? "ok" : "FAIL", r ? 0UL : GetLastError(), got);
-        if (r) printf("  first bytes: %02X %02X %02X %02X\n", buf[0], buf[1], buf[2], buf[3]);
-    }
-    else printf("  no MEM_IMAGE region reachable\n");
 
     CloseHandle(g_proc);
     g_proc = nullptr;
@@ -807,6 +767,11 @@ int main(int argc, char** argv)
             pidArg = static_cast<DWORD>(strtoul(argv[++i], nullptr, 10));
             continue;
         }
+        if (!_stricmp(argv[i], "--base") && i + 1 < argc)
+        {
+            g_forcedBase = static_cast<uintptr_t>(_strtoui64(argv[++i], nullptr, 16));
+            continue;
+        }
         MultiByteToWideChar(CP_ACP, 0, argv[i], -1, nameArg, MAX_PATH);
     }
 
@@ -826,8 +791,7 @@ int main(int argc, char** argv)
     else if (nameArg[0])
     {
         pid = findPidExact(nameArg);
-        if (pid)
-            wcscpy_s(g_procName, nameArg);
+        if (pid) wcscpy_s(g_procName, nameArg);
         else
         {
             pid = findPidKeyword(nameArg);
@@ -848,13 +812,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (doDiag)
-    {
-        diag(pid);
-        system("pause");
-        return 0;
-    }
-
     if (!g_procName[0] && !exeNameForPid(pid))
     {
         printf("[!] could not resolve exe name for pid %lu\n", pid);
@@ -870,23 +827,42 @@ int main(int argc, char** argv)
     }
 
     loadNt();
-    detectBitness();
+    readFilePeInfo();
+
+    if (doDiag)
+    {
+        diag(pid);
+        system("pause");
+        return 0;
+    }
 
     bool haveBase = false;
-    for (int i = 0; i < 10 && !haveBase; ++i)
+    for (int i = 0; i < 3 && !haveBase; ++i)
     {
         haveBase = resolveModuleBase(pid);
         if (!haveBase) Sleep(150);
     }
+
     if (!haveBase)
     {
         printf("[!] all module base strategies failed\n");
-        printf("    run: instant_loot.exe --pid %lu --diag\n", pid);
+        diag(pid);
         system("pause");
         return 1;
     }
 
-    printf("[+] base %p  size %zx  ptr %zu\n", (void*)g_base, g_size, g_ptrSize);
+    if (!g_size)
+    {
+        g_size = g_file.ok ? g_file.sizeOfImage : 0x8000000;
+        printf("[!] size unknown, assuming 0x%zX\n", g_size);
+    }
+    else if (g_file.ok && g_file.sizeOfImage > g_size)
+    {
+        g_size = g_file.sizeOfImage;
+    }
+
+    printf("[+] base %p  size %zx  ptr %zu  header %s\n",
+           (void*)g_base, g_size, g_ptrSize, probeHeader(g_base) ? "ok" : "erased");
 
     if (loot)
     {
