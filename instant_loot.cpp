@@ -20,6 +20,7 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
 
